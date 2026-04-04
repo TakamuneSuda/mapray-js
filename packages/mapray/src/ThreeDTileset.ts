@@ -21,6 +21,424 @@ type TileRefine = "ADD" | "REPLACE";
 let dracoDecoderModulePromise: Promise<any> | null = null;
 const temp_bounding_point = GeoMath.createVector3();
 const temp_bounding_center = GeoMath.createVector3();
+const WGS84_FLATTENING = 1 / 298.257223563;
+const WGS84_SEMI_MAJOR_AXIS = 6378137.0;
+const WGS84_SEMI_MINOR_AXIS = WGS84_SEMI_MAJOR_AXIS * (1 - WGS84_FLATTENING);
+const WGS84_ECCENTRICITY_SQUARED = WGS84_FLATTENING * (2 - WGS84_FLATTENING);
+const WGS84_SECOND_ECCENTRICITY_SQUARED =
+    (WGS84_SEMI_MAJOR_AXIS * WGS84_SEMI_MAJOR_AXIS - WGS84_SEMI_MINOR_AXIS * WGS84_SEMI_MINOR_AXIS) /
+    (WGS84_SEMI_MINOR_AXIS * WGS84_SEMI_MINOR_AXIS);
+const PNTS_TRANSFORM_WORKER_SOURCE = `
+const DEGREE = Math.PI / 180.0;
+const EARTH_RADIUS = 6378137.0;
+const WGS84_FLATTENING = 1 / 298.257223563;
+const WGS84_SEMI_MAJOR_AXIS = 6378137.0;
+const WGS84_SEMI_MINOR_AXIS = WGS84_SEMI_MAJOR_AXIS * (1 - WGS84_FLATTENING);
+const WGS84_ECCENTRICITY_SQUARED = WGS84_FLATTENING * (2 - WGS84_FLATTENING);
+const WGS84_SECOND_ECCENTRICITY_SQUARED =
+    (WGS84_SEMI_MAJOR_AXIS * WGS84_SEMI_MAJOR_AXIS - WGS84_SEMI_MINOR_AXIS * WGS84_SEMI_MINOR_AXIS) /
+    (WGS84_SEMI_MINOR_AXIS * WGS84_SEMI_MINOR_AXIS);
+
+function transformPosition(mat, x, y, z) {
+    return [
+        x*mat[0] + y*mat[4] + z*mat[8] + mat[12],
+        x*mat[1] + y*mat[5] + z*mat[9] + mat[13],
+        x*mat[2] + y*mat[6] + z*mat[10] + mat[14],
+    ];
+}
+
+function transformDirection(mat, x, y, z) {
+    return [
+        x*mat[0] + y*mat[4] + z*mat[8],
+        x*mat[1] + y*mat[5] + z*mat[9],
+        x*mat[2] + y*mat[6] + z*mat[10],
+    ];
+}
+
+function normalize(vec) {
+    const length = Math.hypot(vec[0], vec[1], vec[2]);
+    if ( length <= 1e-12 ) {
+        return [0, 0, 1];
+    }
+    return [vec[0] / length, vec[1] / length, vec[2] / length];
+}
+
+function convertEcefToGeo(position) {
+    const x = position[0];
+    const y = position[1];
+    const z = position[2];
+    const xy = Math.hypot(x, y);
+
+    let latitude;
+    let altitude;
+
+    if ( xy < 1e-9 ) {
+        latitude = z >= 0 ? 90 : -90;
+        altitude = Math.abs(z) - WGS84_SEMI_MINOR_AXIS;
+    }
+    else {
+        const theta = Math.atan2(WGS84_SEMI_MAJOR_AXIS * z, WGS84_SEMI_MINOR_AXIS * xy);
+        const sinTheta = Math.sin(theta);
+        const cosTheta = Math.cos(theta);
+        const latitudeRad = Math.atan2(
+            z + WGS84_SECOND_ECCENTRICITY_SQUARED * WGS84_SEMI_MINOR_AXIS * sinTheta*sinTheta*sinTheta,
+            xy - WGS84_ECCENTRICITY_SQUARED * WGS84_SEMI_MAJOR_AXIS * cosTheta*cosTheta*cosTheta
+        );
+        const sinLatitude = Math.sin(latitudeRad);
+        const primeVerticalRadius = WGS84_SEMI_MAJOR_AXIS / Math.sqrt(1 - WGS84_ECCENTRICITY_SQUARED * sinLatitude*sinLatitude);
+
+        latitude = latitudeRad / DEGREE;
+        altitude = xy / Math.cos(latitudeRad) - primeVerticalRadius;
+    }
+
+    return {
+        longitude: Math.atan2(y, x) / DEGREE,
+        latitude,
+        altitude,
+    };
+}
+
+function geoToMaprayGocs(geo) {
+    const lambda = geo.longitude * DEGREE;
+    const phi = geo.latitude * DEGREE;
+    const radius = EARTH_RADIUS + geo.altitude;
+    const cosPhi = Math.cos(phi);
+    return [
+        radius * cosPhi * Math.cos(lambda),
+        radius * cosPhi * Math.sin(lambda),
+        radius * Math.sin(phi),
+    ];
+}
+
+function getMlocsBasis(geo) {
+    const lambda = geo.longitude * DEGREE;
+    const phi = geo.latitude * DEGREE;
+    const sinLambda = Math.sin(lambda);
+    const cosLambda = Math.cos(lambda);
+    const sinPhi = Math.sin(phi);
+    const cosPhi = Math.cos(phi);
+
+    return {
+        east: [ -sinLambda, cosLambda, 0 ],
+        north: [ -cosLambda * sinPhi, -sinLambda * sinPhi, cosPhi ],
+        up: [ cosPhi * cosLambda, cosPhi * sinLambda, sinPhi ],
+    };
+}
+
+function dot3(a0, a1, a2, b) {
+    return a0*b[0] + a1*b[1] + a2*b[2];
+}
+
+function packColor(value) {
+    const clamped = Math.min(1, Math.max(0, value));
+    return Math.round(clamped * 255);
+}
+
+function packNormal(value) {
+    const clamped = Math.min(1, Math.max(-1, value));
+    return Math.round(clamped * 127);
+}
+
+self.onmessage = function(event) {
+    const data = event.data;
+
+    try {
+        const tileTransform = data.tileTransform;
+        const rtcCenter = data.rtcCenter;
+        const positions = data.positions;
+        const colors = data.colors;
+        const normals = data.normals;
+        const count = positions.length / 3;
+
+        let minX = Number.POSITIVE_INFINITY;
+        let minY = Number.POSITIVE_INFINITY;
+        let minZ = Number.POSITIVE_INFINITY;
+        let maxX = Number.NEGATIVE_INFINITY;
+        let maxY = Number.NEGATIVE_INFINITY;
+        let maxZ = Number.NEGATIVE_INFINITY;
+
+        for ( let i = 0; i < count; ++i ) {
+            const x = positions[3*i + 0];
+            const y = positions[3*i + 1];
+            const z = positions[3*i + 2];
+            if ( x < minX ) minX = x;
+            if ( y < minY ) minY = y;
+            if ( z < minZ ) minZ = z;
+            if ( x > maxX ) maxX = x;
+            if ( y > maxY ) maxY = y;
+            if ( z > maxZ ) maxZ = z;
+        }
+
+        const anchorTile = [
+            rtcCenter[0] + 0.5 * (minX + maxX),
+            rtcCenter[1] + 0.5 * (minY + maxY),
+            rtcCenter[2] + 0.5 * (minZ + maxZ),
+        ];
+        const anchorEcef = transformPosition(tileTransform, anchorTile[0], anchorTile[1], anchorTile[2]);
+        const anchorGeo = convertEcefToGeo(anchorEcef);
+        const anchorMapray = geoToMaprayGocs(anchorGeo);
+        const basis = getMlocsBasis(anchorGeo);
+
+        const transformedPositions = new Float32Array(count * 3);
+        const packedColors = new Uint8Array(count * 4);
+        const packedNormals = normals ? new Int8Array(count * 4) : null;
+        const bboxMin = new Float32Array([Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]);
+        const bboxMax = new Float32Array([Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY]);
+
+        for ( let i = 0; i < count; ++i ) {
+            const tileX = rtcCenter[0] + positions[3*i + 0];
+            const tileY = rtcCenter[1] + positions[3*i + 1];
+            const tileZ = rtcCenter[2] + positions[3*i + 2];
+            const worldEcef = transformPosition(tileTransform, tileX, tileY, tileZ);
+            const worldMapray = geoToMaprayGocs(convertEcefToGeo(worldEcef));
+            const dx = worldMapray[0] - anchorMapray[0];
+            const dy = worldMapray[1] - anchorMapray[1];
+            const dz = worldMapray[2] - anchorMapray[2];
+
+            const localX = dot3(dx, dy, dz, basis.east);
+            const localY = dot3(dx, dy, dz, basis.north);
+            const localZ = dot3(dx, dy, dz, basis.up);
+
+            transformedPositions[3*i + 0] = localX;
+            transformedPositions[3*i + 1] = localY;
+            transformedPositions[3*i + 2] = localZ;
+
+            if ( localX < bboxMin[0] ) bboxMin[0] = localX;
+            if ( localY < bboxMin[1] ) bboxMin[1] = localY;
+            if ( localZ < bboxMin[2] ) bboxMin[2] = localZ;
+            if ( localX > bboxMax[0] ) bboxMax[0] = localX;
+            if ( localY > bboxMax[1] ) bboxMax[1] = localY;
+            if ( localZ > bboxMax[2] ) bboxMax[2] = localZ;
+
+            packedColors[4*i + 0] = packColor(colors[4*i + 0]);
+            packedColors[4*i + 1] = packColor(colors[4*i + 1]);
+            packedColors[4*i + 2] = packColor(colors[4*i + 2]);
+            packedColors[4*i + 3] = packColor(colors[4*i + 3]);
+
+            if ( packedNormals ) {
+                const worldNormal = transformDirection(tileTransform, normals[3*i + 0], normals[3*i + 1], normals[3*i + 2]);
+                const localNormal = normalize([
+                    dot3(worldNormal[0], worldNormal[1], worldNormal[2], basis.east),
+                    dot3(worldNormal[0], worldNormal[1], worldNormal[2], basis.north),
+                    dot3(worldNormal[0], worldNormal[1], worldNormal[2], basis.up),
+                ]);
+
+                packedNormals[4*i + 0] = packNormal(localNormal[0]);
+                packedNormals[4*i + 1] = packNormal(localNormal[1]);
+                packedNormals[4*i + 2] = packNormal(localNormal[2]);
+                packedNormals[4*i + 3] = 0;
+            }
+        }
+
+        const transferables = [
+            transformedPositions.buffer,
+            packedColors.buffer,
+            bboxMin.buffer,
+            bboxMax.buffer,
+        ];
+        if ( packedNormals ) {
+            transferables.push(packedNormals.buffer);
+        }
+
+        self.postMessage({
+            taskId: data.taskId,
+            result: {
+                positions: transformedPositions,
+                colors: packedColors,
+                normals: packedNormals,
+                bboxMin,
+                bboxMax,
+                anchorGeo,
+            },
+        }, transferables);
+    }
+    catch (error) {
+        self.postMessage({
+            taskId: data.taskId,
+            error: error && error.message ? error.message : String(error),
+        });
+    }
+};
+`;
+
+
+interface PntsTransformWorkerResult {
+    positions: Float32Array;
+    colors: Uint8Array;
+    normals: Int8Array | null;
+    bboxMin: Vector3;
+    bboxMax: Vector3;
+    anchorGeo: {
+        longitude: number;
+        latitude: number;
+        altitude: number;
+    };
+}
+
+
+class PntsTransformWorkerPool {
+
+    private readonly _workers: PntsTransformWorkerPool.Slot[];
+
+    private readonly _queue: PntsTransformWorkerPool.Pending[];
+
+    private _next_task_id: number;
+
+    private constructor( workers: PntsTransformWorkerPool.Slot[] )
+    {
+        this._workers = workers;
+        this._queue = [];
+        this._next_task_id = 1;
+    }
+
+
+    static create( worker_count: number ): PntsTransformWorkerPool | null
+    {
+        if (
+            typeof window === "undefined" ||
+            typeof window.Worker === "undefined" ||
+            typeof window.Blob === "undefined" ||
+            typeof window.URL?.createObjectURL !== "function"
+        ) {
+            return null;
+        }
+
+        const worker_url = window.URL.createObjectURL(
+            new window.Blob( [PNTS_TRANSFORM_WORKER_SOURCE], { type: "text/javascript" } )
+        );
+
+        try {
+            const workers: PntsTransformWorkerPool.Slot[] = [];
+            for ( let i = 0; i < worker_count; ++i ) {
+                workers.push( { worker: new window.Worker( worker_url ), busy: false } );
+            }
+
+            return new PntsTransformWorkerPool( workers );
+        }
+        catch ( error ) {
+            console.warn( "Failed to create pnts worker pool", error );
+            return null;
+        }
+        finally {
+            window.URL.revokeObjectURL( worker_url );
+        }
+    }
+
+
+    run(
+        payload: Omit<PntsTransformWorkerPool.WorkerRequest, "taskId">,
+        transferables: Transferable[]
+    ): Promise<PntsTransformWorkerResult>
+    {
+        return new Promise( ( resolve, reject ) => {
+            this._queue.push( {
+                task_id: this._next_task_id++,
+                payload,
+                transferables,
+                resolve,
+                reject,
+            } );
+            this._dispatch();
+        } );
+    }
+
+
+    destroy(): void
+    {
+        for ( const slot of this._workers ) {
+            slot.worker.terminate();
+            if ( slot.pending ) {
+                slot.pending.reject( new Error( "pnts worker pool was destroyed" ) );
+                slot.pending = undefined;
+            }
+        }
+
+        while ( this._queue.length > 0 ) {
+            this._queue.shift()!.reject( new Error( "pnts worker pool was destroyed" ) );
+        }
+    }
+
+
+    private _dispatch(): void
+    {
+        for ( const slot of this._workers ) {
+            if ( slot.busy || this._queue.length === 0 ) {
+                continue;
+            }
+
+            const pending = this._queue.shift()!;
+            slot.busy = true;
+            slot.pending = pending;
+
+            slot.worker.onmessage = event => {
+                slot.busy = false;
+                const current = slot.pending;
+                slot.pending = undefined;
+
+                if ( current ) {
+                    if ( event.data?.error ) {
+                        current.reject( new Error( String( event.data.error ) ) );
+                    }
+                    else {
+                        current.resolve( event.data.result as PntsTransformWorkerResult );
+                    }
+                }
+
+                this._dispatch();
+            };
+
+            slot.worker.onerror = event => {
+                slot.busy = false;
+                const current = slot.pending;
+                slot.pending = undefined;
+                if ( current ) {
+                    current.reject( event.error instanceof Error ? event.error : new Error( event.message || "Worker error" ) );
+                }
+                this._dispatch();
+            };
+
+            slot.worker.postMessage(
+                {
+                    taskId: pending.task_id,
+                    ...pending.payload,
+                },
+                pending.transferables
+            );
+        }
+    }
+
+}
+
+
+namespace PntsTransformWorkerPool {
+
+export interface WorkerRequest {
+    taskId: number;
+    tileTransform: Matrix;
+    rtcCenter: Vector3;
+    positions: Float32Array;
+    colors: Float32Array;
+    normals: Float32Array | null;
+}
+
+
+export interface Pending {
+    task_id: number;
+    payload: Omit<WorkerRequest, "taskId">;
+    transferables: Transferable[];
+    resolve: ( value: PntsTransformWorkerResult ) => void;
+    reject: ( error: Error ) => void;
+}
+
+
+export interface Slot {
+    worker: Worker;
+    busy: boolean;
+    pending?: Pending;
+}
+
+
+}
 
 
 /**
@@ -45,6 +463,10 @@ class ThreeDTileset {
 
     private readonly _cache_hold_frames: number;
 
+    private readonly _point_size: number;
+
+    private readonly _point_shape: ThreeDTileset.PointShape;
+
     private readonly _model_matrix: Matrix;
 
     private readonly _point_material: ThreeDTilesPointMaterial;
@@ -54,6 +476,18 @@ class ThreeDTileset {
     private readonly _cache_retained_meshes: Map<string, Mesh[]>;
 
     private readonly _mesh_ref_counts: Map<Mesh, number>;
+
+    private readonly _pnts_worker_pool: PntsTransformWorkerPool | null;
+
+    private readonly _opaque_primitives: Primitive[];
+
+    private readonly _translucent_primitives: Primitive[];
+
+    private readonly _cached_touched_tiles: ThreeDTileset.Tile[];
+
+    private readonly _cached_gocs_to_view: Matrix;
+
+    private readonly _cached_gocs_to_clip: Matrix;
 
     private _root_tile: ThreeDTileset.Tile | null;
 
@@ -71,6 +505,14 @@ class ThreeDTileset {
 
     private _load_error: Error | null;
 
+    private _frame_cache_valid: boolean;
+
+    private _frame_cache_dirty: boolean;
+
+    private _frame_has_unresolved_tiles: boolean;
+
+    private _cached_pixel_step: number;
+
 
     constructor( viewer: Viewer, resource: Resource | string | ThreeDTileset.ResourceInfo, options: ThreeDTileset.Option = {} )
     {
@@ -80,11 +522,32 @@ class ThreeDTileset {
         this._max_concurrent_requests = Math.max( 1, Math.floor( options.maxConcurrentRequests ?? 8 ) );
         this._max_cached_tiles = Math.max( this._max_concurrent_requests, Math.floor( options.maxCachedTiles ?? 256 ) );
         this._cache_hold_frames = Math.max( 1, Math.floor( options.cacheHoldFrames ?? 60 ) );
+        this._point_size = Math.max( 1, Number( options.pointSize ?? 5.0 ) );
+        this._point_shape = ThreeDTileset._normalizePointShape( options.pointShape );
         this._model_matrix = GeoMath.createMatrix( options.model_matrix ?? GeoMath.setIdentity( GeoMath.createMatrix() ) );
-        this._point_material = new ThreeDTilesPointMaterial( viewer.glenv );
+        this._point_material = new ThreeDTilesPointMaterial( viewer.glenv, this._point_shape );
         this._model_primitive_cache = new Map();
         this._cache_retained_meshes = new Map();
         this._mesh_ref_counts = new Map();
+        this._pnts_worker_pool = PntsTransformWorkerPool.create(
+            Math.max(
+                1,
+                Math.min(
+                    this._max_concurrent_requests,
+                    Math.min(
+                        4,
+                        typeof navigator !== "undefined" && Number.isFinite( navigator.hardwareConcurrency ) ?
+                            Math.max( 1, navigator.hardwareConcurrency - 1 ) :
+                            1
+                    )
+                )
+            )
+        );
+        this._opaque_primitives = [];
+        this._translucent_primitives = [];
+        this._cached_touched_tiles = [];
+        this._cached_gocs_to_view = GeoMath.createMatrix();
+        this._cached_gocs_to_clip = GeoMath.createMatrix();
 
         this._root_tile = null;
         this._active_requests = 0;
@@ -94,6 +557,10 @@ class ThreeDTileset {
         this._destroyed = false;
         this._ready = false;
         this._load_error = null;
+        this._frame_cache_valid = false;
+        this._frame_cache_dirty = true;
+        this._frame_has_unresolved_tiles = true;
+        this._cached_pixel_step = Number.NaN;
 
         this._custom_scene = viewer.custom_scene_collection.createScene( {
             visibility: options.visibility ?? true,
@@ -145,6 +612,20 @@ class ThreeDTileset {
     }
 
 
+    private static _normalizePointShape( point_shape: ThreeDTileset.PointShape | undefined ): ThreeDTileset.PointShape
+    {
+        switch ( point_shape ) {
+            case "rectangle":
+            case "circle":
+            case "circle_with_border":
+            case "gradient_circle":
+                return point_shape;
+            default:
+                return "gradient_circle";
+        }
+    }
+
+
     private async _loadRootTileset(): Promise<void>
     {
         try {
@@ -162,6 +643,7 @@ class ThreeDTileset {
             );
             this._root_tile = parsed.root;
             this._ready = true;
+            this._markFrameCacheDirty();
         }
         catch ( error ) {
             const err = error instanceof Error ? error : new Error( String( error ) );
@@ -410,23 +892,21 @@ class ThreeDTileset {
             GeoMath.transformDirection_A( transform, GeoMath.createVector3( [box[6],  box[7],  box[8]]  ), GeoMath.createVector3() ),
             GeoMath.transformDirection_A( transform, GeoMath.createVector3( [box[9], box[10], box[11]] ), GeoMath.createVector3() ),
         ];
+        const corners = ThreeDTileset._createBoxCorners( center, half_axes ).map( corner =>
+            ThreeDTileset._convertEcefToMaprayGocs( corner, GeoMath.createVector3() )
+        );
 
-        return {
-            center,
-            radius: Math.sqrt(
-                ThreeDTileset._squaredLength( half_axes[0] ) +
-                ThreeDTileset._squaredLength( half_axes[1] ) +
-                ThreeDTileset._squaredLength( half_axes[2] )
-            ),
-            corners: ThreeDTileset._createBoxCorners( center, half_axes ),
-        };
+        return ThreeDTileset._createBoundingVolumeFromCorners( corners );
     }
 
 
     private static _createSphereBoundingVolume( sphere: number[], transform: Matrix ): ThreeDTileset.BoundingVolume
     {
+        const center = GeoMath.transformPosition_A( transform, GeoMath.createVector3( [sphere[0], sphere[1], sphere[2]] ), GeoMath.createVector3() );
+        const mapray_center = ThreeDTileset._convertEcefToMaprayGocs( center, GeoMath.createVector3() );
+
         return {
-            center: GeoMath.transformPosition_A( transform, GeoMath.createVector3( [sphere[0], sphere[1], sphere[2]] ), GeoMath.createVector3() ),
+            center: mapray_center,
             radius: sphere[3] * ThreeDTileset._maxScale( transform ),
             corners: null,
         };
@@ -513,6 +993,89 @@ class ThreeDTileset {
     }
 
 
+    private static _convertEcefToGeoPoint( position: Vector3 ): GeoPoint
+    {
+        const x = position[0];
+        const y = position[1];
+        const z = position[2];
+        const xy = Math.sqrt( x*x + y*y );
+
+        let latitude: number;
+        let altitude: number;
+
+        if ( xy < 1e-9 ) {
+            latitude = z >= 0 ? 90 : -90;
+            altitude = Math.abs( z ) - WGS84_SEMI_MINOR_AXIS;
+        }
+        else {
+            const theta = Math.atan2( WGS84_SEMI_MAJOR_AXIS * z, WGS84_SEMI_MINOR_AXIS * xy );
+            const sin_theta = Math.sin( theta );
+            const cos_theta = Math.cos( theta );
+
+            const latitude_rad = Math.atan2(
+                z + WGS84_SECOND_ECCENTRICITY_SQUARED * WGS84_SEMI_MINOR_AXIS * sin_theta*sin_theta*sin_theta,
+                xy - WGS84_ECCENTRICITY_SQUARED * WGS84_SEMI_MAJOR_AXIS * cos_theta*cos_theta*cos_theta
+            );
+            const sin_latitude = Math.sin( latitude_rad );
+            const prime_vertical_radius = WGS84_SEMI_MAJOR_AXIS / Math.sqrt( 1 - WGS84_ECCENTRICITY_SQUARED * sin_latitude*sin_latitude );
+
+            latitude = latitude_rad / GeoMath.DEGREE;
+            altitude = xy / Math.cos( latitude_rad ) - prime_vertical_radius;
+        }
+
+        return new GeoPoint(
+            Math.atan2( y, x ) / GeoMath.DEGREE,
+            latitude,
+            altitude
+        );
+    }
+
+
+    private static _convertEcefToMaprayGocs( position: Vector3, dst: Vector3 ): Vector3
+    {
+        return ThreeDTileset._convertEcefToGeoPoint( position ).getAsGocs( dst );
+    }
+
+
+    private static _createBoundingVolumeFromCorners( corners: Vector3[] ): ThreeDTileset.BoundingVolume
+    {
+        const center = GeoMath.createVector3();
+        for ( const corner of corners ) {
+            center[0] += corner[0];
+            center[1] += corner[1];
+            center[2] += corner[2];
+        }
+        center[0] /= corners.length;
+        center[1] /= corners.length;
+        center[2] /= corners.length;
+
+        let radius = 0;
+        for ( const corner of corners ) {
+            radius = Math.max( radius, Math.sqrt( ThreeDTileset._squaredDistance( center, corner ) ) );
+        }
+
+        return { center, radius, corners };
+    }
+
+
+    private static _transformWorldDeltaToMlocs( mlocs_to_gocs: Matrix, delta: Vector3, dst: Vector3 ): Vector3
+    {
+        dst[0] = delta[0] * mlocs_to_gocs[0] + delta[1] * mlocs_to_gocs[1] + delta[2] * mlocs_to_gocs[2];
+        dst[1] = delta[0] * mlocs_to_gocs[4] + delta[1] * mlocs_to_gocs[5] + delta[2] * mlocs_to_gocs[6];
+        dst[2] = delta[0] * mlocs_to_gocs[8] + delta[1] * mlocs_to_gocs[9] + delta[2] * mlocs_to_gocs[10];
+        return dst;
+    }
+
+
+    private static _transformWorldPositionToMlocs( mlocs_to_gocs: Matrix, origin: Vector3, position: Vector3, dst: Vector3 ): Vector3
+    {
+        dst[0] = (position[0] - origin[0]) * mlocs_to_gocs[0] + (position[1] - origin[1]) * mlocs_to_gocs[1] + (position[2] - origin[2]) * mlocs_to_gocs[2];
+        dst[1] = (position[0] - origin[0]) * mlocs_to_gocs[4] + (position[1] - origin[1]) * mlocs_to_gocs[5] + (position[2] - origin[2]) * mlocs_to_gocs[6];
+        dst[2] = (position[0] - origin[0]) * mlocs_to_gocs[8] + (position[1] - origin[1]) * mlocs_to_gocs[9] + (position[2] - origin[2]) * mlocs_to_gocs[10];
+        return dst;
+    }
+
+
     private _draw( stage: RenderStage ): void
     {
         if ( this._destroyed || stage.getRenderTarget() !== RenderStage.RenderTarget.SCENE ) {
@@ -524,12 +1087,21 @@ class ThreeDTileset {
             return;
         }
 
-        const opaque_primitives: Primitive[] = [];
-        const translucent_primitives: Primitive[] = [];
+        if ( this._shouldReuseFrameCache( stage ) ) {
+            this._touchCachedTiles();
+        }
+        else {
+            this._opaque_primitives.length = 0;
+            this._translucent_primitives.length = 0;
+            this._cached_touched_tiles.length = 0;
+            this._frame_has_unresolved_tiles = false;
 
-        this._collectTilePrimitives( root, stage, opaque_primitives, translucent_primitives );
-        this._drawOpaquePrimitives( stage, opaque_primitives );
-        this._drawTranslucentPrimitives( stage, translucent_primitives );
+            this._collectTilePrimitives( root, stage, this._opaque_primitives, this._translucent_primitives );
+            this._updateFrameCacheSnapshot( stage );
+        }
+
+        this._drawOpaquePrimitives( stage, this._opaque_primitives );
+        this._drawTranslucentPrimitives( stage, this._translucent_primitives );
     }
 
 
@@ -541,6 +1113,7 @@ class ThreeDTileset {
     ): boolean
     {
         tile.last_touched_frame = this._frame_counter;
+        this._cached_touched_tiles.push( tile );
 
         const traversal_bv = tile.bounding_volume;
         if ( !ThreeDTileset._isBoundingVolumeVisible( traversal_bv, stage ) ) {
@@ -554,6 +1127,9 @@ class ThreeDTileset {
 
         if ( tile.content_state === ThreeDTileset.ContentState.UNLOADED ) {
             this._pushRequestQueue( tile, screen_space_error, distance );
+        }
+        if ( tile.content_entries.length > 0 && tile.content_state !== ThreeDTileset.ContentState.READY ) {
+            this._frame_has_unresolved_tiles = true;
         }
 
         const can_draw_self = tile.content_state === ThreeDTileset.ContentState.READY && tile.primitives !== null;
@@ -583,7 +1159,7 @@ class ThreeDTileset {
         const draw_bv = tile.content_bounding_volume ?? traversal_bv;
         const should_draw_self = (
             can_draw_self &&
-            ThreeDTileset._isBoundingVolumeVisible( draw_bv, stage ) &&
+            ( draw_bv === traversal_bv || ThreeDTileset._isBoundingVolumeVisible( draw_bv, stage ) ) &&
             (
                 tile.refine === "ADD" ||
                 !needs_refine ||
@@ -767,6 +1343,7 @@ class ThreeDTileset {
         tile.external_tiles = external_tiles;
         tile.content_state = ThreeDTileset.ContentState.READY;
         this._loaded_tiles.add( tile );
+        this._markFrameCacheDirty();
     }
 
 
@@ -1133,8 +1710,40 @@ class ThreeDTileset {
     private async _loadPntsContent( tile: ThreeDTileset.Tile, pnts_binary: ArrayBuffer ): Promise<ThreeDTileset.LoadedContent>
     {
         const parsed = await ThreeDTileset._parsePnts( pnts_binary );
-        const primitive = ThreeDTileset._createPointPrimitive( this._viewer, this._point_material, tile, parsed );
+        parsed.point_size = this._point_size;
+        const primitive = await this._createPointPrimitive( tile, parsed );
         return { primitives: [primitive], external_tiles: [] };
+    }
+
+
+    private async _createPointPrimitive( tile: ThreeDTileset.Tile, parsed: ThreeDTileset.ParsedPnts ): Promise<Primitive>
+    {
+        if ( this._pnts_worker_pool ) {
+            try {
+                const transformed = await this._pnts_worker_pool.run(
+                    {
+                        tileTransform: tile.computed_transform,
+                        rtcCenter: parsed.rtc_center,
+                        positions: parsed.positions,
+                        colors: parsed.colors,
+                        normals: parsed.normals,
+                    },
+                    []
+                );
+
+                return ThreeDTileset._createPointPrimitiveFromTransformedData(
+                    this._viewer,
+                    this._point_material,
+                    transformed,
+                    parsed
+                );
+            }
+            catch ( error ) {
+                console.warn( "Falling back to main-thread pnts transform", error );
+            }
+        }
+
+        return ThreeDTileset._createPointPrimitive( this._viewer, this._point_material, tile, parsed );
     }
 
 
@@ -2097,14 +2706,42 @@ class ThreeDTileset {
             0.5 * (min[2] + max[2]),
         ] );
         const anchor = GeoMath.add3( parsed.rtc_center, local_center, GeoMath.createVector3() );
+        const anchor_ecef = GeoMath.transformPosition_A( tile.computed_transform, anchor, GeoMath.createVector3() );
+        const anchor_geo_point = ThreeDTileset._convertEcefToGeoPoint( anchor_ecef );
+        const mlocs_to_gocs = anchor_geo_point.getMlocsToGocsMatrix( GeoMath.createMatrix() );
+        const gocs_to_mlocs = GeoMath.inverse_A( mlocs_to_gocs, GeoMath.createMatrix() );
 
         const positions = new Float32Array( count * 3 );
         const colors = new Uint8Array( count * 4 );
         const normals = parsed.normals ? new Int8Array( count * 4 ) : null;
+        const transformed_min = GeoMath.createVector3( [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY] );
+        const transformed_max = GeoMath.createVector3( [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY] );
+        const tile_position = GeoMath.createVector3();
+        const world_position = GeoMath.createVector3();
+        const mapray_world_position = GeoMath.createVector3();
+        const transformed_position = GeoMath.createVector3();
+        const local_normal = GeoMath.createVector3();
+        const world_normal = GeoMath.createVector3();
+        const transformed_normal = GeoMath.createVector3();
+
         for ( let i = 0; i < count; ++i ) {
-            positions[3*i + 0] = parsed.positions[3*i + 0] - local_center[0];
-            positions[3*i + 1] = parsed.positions[3*i + 1] - local_center[1];
-            positions[3*i + 2] = parsed.positions[3*i + 2] - local_center[2];
+            tile_position[0] = parsed.rtc_center[0] + parsed.positions[3*i + 0];
+            tile_position[1] = parsed.rtc_center[1] + parsed.positions[3*i + 1];
+            tile_position[2] = parsed.rtc_center[2] + parsed.positions[3*i + 2];
+            GeoMath.transformPosition_A( tile.computed_transform, tile_position, world_position );
+            ThreeDTileset._convertEcefToMaprayGocs( world_position, mapray_world_position );
+            GeoMath.transformPosition_A( gocs_to_mlocs, mapray_world_position, transformed_position );
+
+            positions[3*i + 0] = transformed_position[0];
+            positions[3*i + 1] = transformed_position[1];
+            positions[3*i + 2] = transformed_position[2];
+
+            transformed_min[0] = Math.min( transformed_min[0], transformed_position[0] );
+            transformed_min[1] = Math.min( transformed_min[1], transformed_position[1] );
+            transformed_min[2] = Math.min( transformed_min[2], transformed_position[2] );
+            transformed_max[0] = Math.max( transformed_max[0], transformed_position[0] );
+            transformed_max[1] = Math.max( transformed_max[1], transformed_position[1] );
+            transformed_max[2] = Math.max( transformed_max[2], transformed_position[2] );
 
             colors[4*i + 0] = ThreeDTileset._packPointColor( parsed.colors[4*i + 0] );
             colors[4*i + 1] = ThreeDTileset._packPointColor( parsed.colors[4*i + 1] );
@@ -2112,38 +2749,75 @@ class ThreeDTileset {
             colors[4*i + 3] = ThreeDTileset._packPointColor( parsed.colors[4*i + 3] );
 
             if ( normals ) {
-                normals[4*i + 0] = ThreeDTileset._packPointNormal( parsed.normals![3*i + 0] );
-                normals[4*i + 1] = ThreeDTileset._packPointNormal( parsed.normals![3*i + 1] );
-                normals[4*i + 2] = ThreeDTileset._packPointNormal( parsed.normals![3*i + 2] );
+                local_normal[0] = parsed.normals![3*i + 0];
+                local_normal[1] = parsed.normals![3*i + 1];
+                local_normal[2] = parsed.normals![3*i + 2];
+                GeoMath.transformDirection_A( tile.computed_transform, local_normal, world_normal );
+                ThreeDTileset._transformWorldDeltaToMlocs( mlocs_to_gocs, world_normal, transformed_normal );
+                GeoMath.normalize3( transformed_normal, transformed_normal );
+
+                normals[4*i + 0] = ThreeDTileset._packPointNormal( transformed_normal[0] );
+                normals[4*i + 1] = ThreeDTileset._packPointNormal( transformed_normal[1] );
+                normals[4*i + 2] = ThreeDTileset._packPointNormal( transformed_normal[2] );
                 normals[4*i + 3] = 0;
             }
         }
 
+        return ThreeDTileset._createPointPrimitiveFromTransformedData(
+            viewer,
+            material,
+            {
+                positions,
+                colors,
+                normals,
+                bboxMin: transformed_min,
+                bboxMax: transformed_max,
+                anchorGeo: {
+                    longitude: anchor_geo_point.longitude,
+                    latitude: anchor_geo_point.latitude,
+                    altitude: anchor_geo_point.altitude,
+                },
+            },
+            parsed
+        );
+    }
+
+
+    private static _createPointPrimitiveFromTransformedData(
+        viewer: Viewer,
+        material: ThreeDTilesPointMaterial,
+        transformed: PntsTransformWorkerResult,
+        parsed: ThreeDTileset.ParsedPnts
+    ): Primitive
+    {
+        const count = transformed.positions.length / 3;
+        const anchor_geo_point = new GeoPoint(
+            transformed.anchorGeo.longitude,
+            transformed.anchorGeo.latitude,
+            transformed.anchorGeo.altitude
+        );
+        const mlocs_to_gocs = anchor_geo_point.getMlocsToGocsMatrix( GeoMath.createMatrix() );
+
         const init = new Mesh.Initializer( Mesh.DrawMode.POINTS, count );
-        init.addAttribute( "a_position", new MeshBuffer( viewer.glenv, positions ), 3, Mesh.ComponentType.FLOAT );
-        init.addAttribute( "a_color", new MeshBuffer( viewer.glenv, colors ), 4, Mesh.ComponentType.UNSIGNED_BYTE, { normalized: true } );
-        if ( normals ) {
-            init.addAttribute( "a_normal", new MeshBuffer( viewer.glenv, normals ), 3, Mesh.ComponentType.BYTE, { normalized: true, byte_stride: 4 } );
+        init.addAttribute( "a_position", new MeshBuffer( viewer.glenv, transformed.positions ), 3, Mesh.ComponentType.FLOAT );
+        init.addAttribute( "a_color", new MeshBuffer( viewer.glenv, transformed.colors ), 4, Mesh.ComponentType.UNSIGNED_BYTE, { normalized: true } );
+        if ( transformed.normals ) {
+            init.addAttribute( "a_normal", new MeshBuffer( viewer.glenv, transformed.normals ), 3, Mesh.ComponentType.BYTE, { normalized: true, byte_stride: 4 } );
         }
 
         const mesh = new Mesh( viewer.glenv, init );
-
-        const local_transform = GeoMath.setIdentity( GeoMath.createMatrix() );
-        local_transform[12] = anchor[0];
-        local_transform[13] = anchor[1];
-        local_transform[14] = anchor[2];
 
         const primitive = new Primitive(
             viewer.glenv,
             mesh,
             material,
-            GeoMath.mul_AA( tile.computed_transform, local_transform, GeoMath.createMatrix() )
+            mlocs_to_gocs
         );
 
         primitive.pivot = GeoMath.createVector3();
         primitive.bbox = [
-            GeoMath.createVector3( [min[0] - local_center[0], min[1] - local_center[1], min[2] - local_center[2]] ),
-            GeoMath.createVector3( [max[0] - local_center[0], max[1] - local_center[1], max[2] - local_center[2]] ),
+            GeoMath.createVector3( transformed.bboxMin ),
+            GeoMath.createVector3( transformed.bboxMax ),
         ];
         primitive.properties = {
             point_size: parsed.point_size,
@@ -2151,6 +2825,7 @@ class ThreeDTileset {
             has_normals: parsed.has_normals,
             batch_ids: parsed.batch_ids,
             batch_length: parsed.batch_length,
+            anchor_geo_point,
         };
 
         return primitive;
@@ -2253,6 +2928,7 @@ class ThreeDTileset {
         tile.external_tiles = [];
         tile.content_state = tile.content_entries.length > 0 ? ThreeDTileset.ContentState.UNLOADED : ThreeDTileset.ContentState.READY;
         this._loaded_tiles.delete( tile );
+        this._markFrameCacheDirty();
     }
 
 
@@ -2275,6 +2951,67 @@ class ThreeDTileset {
             tile.content_state = ThreeDTileset.ContentState.UNLOADED;
         }
         this._loaded_tiles.delete( tile );
+        this._markFrameCacheDirty();
+    }
+
+
+    private _shouldReuseFrameCache( stage: RenderStage ): boolean
+    {
+        return (
+            this._frame_cache_valid &&
+            !this._frame_cache_dirty &&
+            !this._frame_has_unresolved_tiles &&
+            this._active_requests === 0 &&
+            this._isStageEquivalent( stage )
+        );
+    }
+
+
+    private _isStageEquivalent( stage: RenderStage ): boolean
+    {
+        if ( !Number.isFinite( this._cached_pixel_step ) || Math.abs( stage.pixel_step - this._cached_pixel_step ) > 1e-9 ) {
+            return false;
+        }
+
+        return (
+            ThreeDTileset._isMatrixEquivalent( stage.gocs_to_view, this._cached_gocs_to_view ) &&
+            ThreeDTileset._isMatrixEquivalent( stage.gocs_to_clip, this._cached_gocs_to_clip )
+        );
+    }
+
+
+    private static _isMatrixEquivalent( a: Matrix, b: Matrix ): boolean
+    {
+        for ( let i = 0; i < 16; ++i ) {
+            if ( Math.abs( a[i] - b[i] ) > 1e-9 ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+
+    private _updateFrameCacheSnapshot( stage: RenderStage ): void
+    {
+        GeoMath.copyMatrix( stage.gocs_to_view, this._cached_gocs_to_view );
+        GeoMath.copyMatrix( stage.gocs_to_clip, this._cached_gocs_to_clip );
+        this._cached_pixel_step = stage.pixel_step;
+        this._frame_cache_valid = true;
+        this._frame_cache_dirty = false;
+    }
+
+
+    private _touchCachedTiles(): void
+    {
+        for ( const tile of this._cached_touched_tiles ) {
+            tile.last_touched_frame = this._frame_counter;
+        }
+    }
+
+
+    private _markFrameCacheDirty(): void
+    {
+        this._frame_cache_dirty = true;
     }
 
 
@@ -2294,11 +3031,17 @@ class ThreeDTileset {
         for ( const meshes of this._cache_retained_meshes.values() ) {
             this._releaseMeshes( meshes );
         }
+        this._pnts_worker_pool?.destroy();
         this._cache_retained_meshes.clear();
         this._model_primitive_cache.clear();
         this._mesh_ref_counts.clear();
         this._loaded_tiles.clear();
         this._root_tile = null;
+        this._frame_cache_valid = false;
+        this._frame_cache_dirty = true;
+        this._cached_touched_tiles.length = 0;
+        this._opaque_primitives.length = 0;
+        this._translucent_primitives.length = 0;
     }
 
 }
@@ -2415,9 +3158,18 @@ export interface Option {
     maxConcurrentRequests?: number;
     maxCachedTiles?: number;
     cacheHoldFrames?: number;
+    pointSize?: number;
+    pointShape?: PointShape;
     model_matrix?: Matrix;
     transform?: Resource.TransformCallback;
 }
+
+
+export type PointShape =
+    "rectangle" |
+    "circle" |
+    "circle_with_border" |
+    "gradient_circle";
 
 
 export type NumericArray =
@@ -2451,14 +3203,28 @@ export const enum ContentState {
 
 class ThreeDTilesPointMaterial extends EntityMaterial {
 
-    constructor( glenv: Viewer["glenv"] )
+    constructor( glenv: Viewer["glenv"], point_shape: ThreeDTileset.PointShape )
     {
         super( glenv, THREE_D_TILES_POINT_VS_CODE, THREE_D_TILES_POINT_FS_CODE );
 
         this.bindProgram();
         this.setFloat( "u_point_size", 3.0 );
         this.setFloat( "u_has_normals", 0.0 );
+        this.setFloat( "u_point_shape", ThreeDTilesPointMaterial._getPointShapeCode( point_shape ) );
         this.setVector3( "u_light_dir", [0, 0, 1] );
+    }
+
+
+    private static _getPointShapeCode( point_shape: ThreeDTileset.PointShape ): number
+    {
+        switch ( point_shape ) {
+            case "rectangle": return 0;
+            case "circle": return 1;
+            case "circle_with_border": return 2;
+            case "gradient_circle":
+            default:
+                return 3;
+        }
     }
 
 
@@ -2489,14 +3255,17 @@ uniform mat4 u_obj_to_clip;
 uniform mat4 u_obj_to_view;
 uniform float u_point_size;
 uniform float u_has_normals;
+uniform float u_point_shape;
 uniform vec3 u_light_dir;
 
 varying vec4 v_color;
+varying float v_point_shape;
 
 void main( void )
 {
     gl_Position = u_obj_to_clip * vec4( a_position, 1.0 );
     gl_PointSize = u_point_size;
+    v_point_shape = u_point_shape;
 
     if ( u_has_normals > 0.5 ) {
         vec3 normal = normalize( (u_obj_to_view * vec4( a_normal, 0.0 )).xyz );
@@ -2515,14 +3284,39 @@ const THREE_D_TILES_POINT_FS_CODE = `
 precision highp float;
 
 varying vec4 v_color;
+varying float v_point_shape;
 
 void main( void )
 {
-    if ( length( gl_PointCoord - 0.5 ) > 0.5 ) {
+    if ( v_point_shape < 0.5 ) {
+        gl_FragColor = v_color;
+        return;
+    }
+
+    vec2 p = 2.0 * gl_PointCoord - 1.0;
+    float distance_to_center = length( p );
+
+    if ( distance_to_center > 1.0 ) {
         discard;
     }
 
-    gl_FragColor = v_color;
+    if ( v_point_shape < 1.5 ) {
+        gl_FragColor = v_color;
+        return;
+    }
+
+    if ( v_point_shape < 2.5 ) {
+        if ( distance_to_center > 0.9 ) {
+            gl_FragColor = vec4( 0.0, 0.0, 0.0, v_color.a );
+        }
+        else {
+            gl_FragColor = v_color;
+        }
+        return;
+    }
+
+    float highlight = clamp( 1.0 - 0.3 * tan( (p.x + p.y) * 0.7853981633 ), 0.6, 1.35 );
+    gl_FragColor = vec4( v_color.rgb * highlight, v_color.a );
 }
 `;
 

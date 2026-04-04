@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Mapray 3D Tiles Debug</title>
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+        }
+
+        #mapray-container {
+            position: relative;
+            height: 100%;
+        }
+
+        #tools {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            width: min(480px, calc(100vw - 32px));
+            color: #f5f7fa;
+            background: rgba(17, 24, 39, 0.88);
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 12px;
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.35);
+            backdrop-filter: blur(8px);
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+
+        .tools-body {
+            padding: 16px;
+        }
+
+        .tools-title {
+            margin: 0 0 12px;
+            font-size: 16px;
+            font-weight: 700;
+        }
+
+        .tools-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        .tools-row label {
+            font-size: 12px;
+            opacity: 0.9;
+        }
+
+        .tools-row input[type="url"],
+        .tools-row input[type="number"],
+        .tools-row select {
+            flex: 1 1 280px;
+            min-width: 0;
+            padding: 9px 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(148, 163, 184, 0.45);
+            background: rgba(15, 23, 42, 0.72);
+            color: inherit;
+        }
+
+        .tools-grid {
+            align-items: end;
+        }
+
+        .tools-field {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            flex: 1 1 96px;
+            min-width: 96px;
+        }
+
+        .tools-row button {
+            padding: 9px 12px;
+            border: 0;
+            border-radius: 8px;
+            background: #38bdf8;
+            color: #082f49;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .tools-row button.secondary {
+            background: #cbd5e1;
+            color: #0f172a;
+        }
+
+        .tools-status {
+            margin: 0;
+            min-height: 7em;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 12px;
+            line-height: 1.5;
+            color: #dbeafe;
+        }
+    </style>
+</head>
+<body>
+    <div id="mapray-container">
+        <div id="tools"></div>
+    </div>
+    <script type="text/javascript">
+        var createDracoDecoderModule = window.createDracoDecoderModule || function() {
+            throw new Error("Draco decoder is not available in this debug build.");
+        };
+        var dracoDecoderWasm = window.dracoDecoderWasm || "";
+
+        window.createDracoDecoderModule = createDracoDecoderModule;
+        window.dracoDecoderWasm = dracoDecoderWasm;
+    </script>
+    <script type="text/javascript" src="./dist/bundle.js"></script>
+    <script type="text/javascript">
+        (function() {
+            if ( typeof window.startApp === "function" ) {
+                window.startApp( "mapray-container" );
+                return;
+            }
+
+            var tools = document.getElementById( "tools" );
+            if ( !tools ) {
+                return;
+            }
+
+            tools.innerHTML = [
+                '<div class="tools-body">',
+                '<h1 class="tools-title">3D Tiles Debug</h1>',
+                '<pre class="tools-status">bundle.js is missing.\n\nRun:\n  npm install\n  MAPRAY_ACCESS_TOKEN=&lt;token&gt; npm run build\nor\n  MAPRAY_ACCESS_TOKEN=&lt;token&gt; npm start\n\nThen open this page from the debug/3dtiles server.</pre>',
+                '</div>'
+            ].join( "" );
+        })();
+    </script>
+</body>
+</html>
