@@ -9,6 +9,10 @@ import typescript from 'rollup-plugin-typescript2';
 import sourcemaps from 'rollup-plugin-sourcemaps';
 
 const outdir = 'dist/';
+const dracoVendorSourceDir = path.resolve( '../../packages/mapray/dist/es/vendor' );
+const dracoWorkerSourcePath = path.resolve( '../../packages/mapray/dist/es/workers/ThreeDTilesDracoDecoderWorker.js' );
+const dracoVendorOutputDir = path.resolve( outdir, 'vendor' );
+const dracoWorkerOutputPath = path.resolve( outdir, 'vendor/ThreeDTilesDracoDecoderWorker.js' );
 
 function loadDotEnv( filePath ) {
     if ( !fs.existsSync( filePath ) ) {
@@ -85,6 +89,32 @@ export default function() {
                 }) :
                 null
             ),
+            {
+                name: 'copy-draco-assets',
+                writeBundle() {
+                    if ( !fs.existsSync( dracoVendorSourceDir ) ) {
+                        throw new Error(
+                            `Missing built Draco vendor dir: ${dracoVendorSourceDir}\n` +
+                            'Run `yarn --cwd packages/mapray build-devel` before building debug/3dtiles.'
+                        );
+                    }
+                    if ( !fs.existsSync( dracoWorkerSourcePath ) ) {
+                        throw new Error(
+                            `Missing built Draco worker: ${dracoWorkerSourcePath}\n` +
+                            'Run `yarn --cwd packages/mapray build-devel` before building debug/3dtiles.'
+                        );
+                    }
+
+                    fs.mkdirSync( dracoVendorOutputDir, { recursive: true } );
+                    for ( const entry of fs.readdirSync( dracoVendorSourceDir ) ) {
+                        fs.copyFileSync(
+                            path.join( dracoVendorSourceDir, entry ),
+                            path.join( dracoVendorOutputDir, entry )
+                        );
+                    }
+                    fs.copyFileSync( dracoWorkerSourcePath, dracoWorkerOutputPath );
+                },
+            },
         ],
     };
 

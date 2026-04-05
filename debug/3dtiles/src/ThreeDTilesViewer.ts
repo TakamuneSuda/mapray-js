@@ -17,9 +17,23 @@ const DEFAULT_POINT_SIZE = 5;
 const DEFAULT_POINT_SHAPE = "gradient_circle";
 
 
+function publishDebugState( state )
+{
+    window["__threeDTilesDebugState"] = state;
+    window.dispatchEvent( new CustomEvent( "mapray-3dtiles-debug-status", { detail: state } ) );
+}
+
+
 function getInitialTilesetUrl()
 {
     return new URLSearchParams( window.location.search ).get( "tileset" ) ?? "";
+}
+
+
+function getInitialFlag( key )
+{
+    const value = new URLSearchParams( window.location.search ).get( key );
+    return value === "1" || value === "true";
 }
 
 
@@ -45,16 +59,29 @@ function getInitialPointShape()
 }
 
 
+function createViewerOptions()
+{
+    const smoke_mode = getInitialFlag( "smoke" );
+    const options = {
+        debug_stats: new mapray.DebugStats(),
+    };
+
+    if ( !smoke_mode ) {
+        options.atmosphere = new mapray.Atmosphere();
+        options.sun_visualizer = new mapray.SunVisualizer( 32 );
+    }
+
+    return options;
+}
+
+
 class ThreeDTilesViewer extends maprayui.StandardUIViewer {
 
     constructor( container )
     {
-        super( container, process.env.MAPRAY_ACCESS_TOKEN, {
-            debug_stats: new mapray.DebugStats(),
-            atmosphere: new mapray.Atmosphere(),
-            sun_visualizer: new mapray.SunVisualizer( 32 ),
-        } );
+        super( container, process.env.MAPRAY_ACCESS_TOKEN, createViewerOptions() );
 
+        this._smoke_mode = getInitialFlag( "smoke" );
         this._tileset_url = getInitialTilesetUrl();
         this._visibility = true;
         this._maximum_screen_space_error = getInitialNumberValue( "sse", DEFAULT_MAXIMUM_SCREEN_SPACE_ERROR, 0.1 );
@@ -304,6 +331,9 @@ class ThreeDTilesViewer extends maprayui.StandardUIViewer {
             return;
         }
 
+        const draco_worker_param = new URL( window.location.href ).searchParams.get( "dracoWorker" );
+        const enable_draco_worker = draco_worker_param !== "0" && draco_worker_param !== "false";
+
         this._tileset = new mapray.ThreeDTileset( this.viewer, this._tileset_url, {
             visibility: this._visibility,
             maximumScreenSpaceError: this._maximum_screen_space_error,
@@ -311,6 +341,9 @@ class ThreeDTilesViewer extends maprayui.StandardUIViewer {
             maxCachedTiles: this._max_cached_tiles,
             pointSize: this._point_size,
             pointShape: this._point_shape,
+            dracoDecoderScriptUrl: "./dist/vendor/draco_wasm_wrapper.js",
+            dracoDecoderWasmUrl: "./dist/vendor/draco_decoder.wasm",
+            dracoDecoderWorkerUrl: enable_draco_worker ? "./dist/vendor/ThreeDTilesDracoDecoderWorker.js" : "",
         } );
 
         void this._updateFocusTarget();
@@ -380,17 +413,36 @@ class ThreeDTilesViewer extends maprayui.StandardUIViewer {
 
     _updateStatus()
     {
+        const render_mode = this.viewer.render_mode === mapray.Viewer.RenderMode.SURFACE ? "surface" : "wireframe";
+        const load_status = this._getLoadStatusText();
         const status_lines = [
             `tileset: ${this._tileset_url || "(not set)"}`,
             `visibility: ${this._visibility ? "on" : "off"}`,
-            `render mode: ${this.viewer.render_mode === mapray.Viewer.RenderMode.SURFACE ? "surface" : "wireframe"}`,
+            `render mode: ${render_mode}`,
             `tuning: sse=${this._maximum_screen_space_error}, concurrency=${this._max_concurrent_requests}, cache=${this._max_cached_tiles}, pointSize=${this._point_size}, pointShape=${this._point_shape}`,
-            `status: ${this._getLoadStatusText()}`,
+            `status: ${load_status}`,
             `focus: ${this._focus_status}`,
             "keys: m = wireframe, r = reload",
         ];
 
         const status_text = status_lines.join( "\n" );
+        publishDebugState( {
+            tilesetUrl: this._tileset_url,
+            visibility: this._visibility,
+            renderMode: render_mode,
+            tuning: {
+                maximumScreenSpaceError: this._maximum_screen_space_error,
+                maxConcurrentRequests: this._max_concurrent_requests,
+                maxCachedTiles: this._max_cached_tiles,
+                pointSize: this._point_size,
+                pointShape: this._point_shape,
+            },
+            loadStatus: load_status,
+            focusStatus: this._focus_status,
+            viewerLoadStatus: { ...this.viewer.load_status },
+            statusText: status_text,
+            updatedAt: Date.now(),
+        } );
 
         if ( status_text === this._last_status_text ) {
             return;

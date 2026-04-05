@@ -1049,24 +1049,29 @@ class Viewer {
         var delta_time = this._updateTime();
         this._requestNextFrame();
 
-        this._updateCanvasSize();
+        try {
+            this._updateCanvasSize();
 
-        this._render_callback.onUpdateFrameInner( delta_time );
-        this._updateUndergroundState();
+            this._render_callback.onUpdateFrameInner( delta_time );
+            this._updateUndergroundState();
 
-        if ( this._debug_stats ) {
-            this._debug_stats.clearStats();
+            if ( this._debug_stats ) {
+                this._debug_stats.clearStats();
+            }
+
+            var stage = new RenderStage.SceneRenderStage( this );
+            stage.render();
+            this._flake_list = stage.flake_list;
+
+            this._postProcess();
         }
-
-        var stage = new RenderStage.SceneRenderStage( this );
-        stage.render();
-        this._flake_list = stage.flake_list;
-
-        this._postProcess();
-
-        this._updateLoadStatus();
-
-        this._finishDebugStats();
+        catch ( error ) {
+            console.error( error );
+        }
+        finally {
+            this._updateLoadStatus();
+            this._finishDebugStats();
+        }
     }
 
 

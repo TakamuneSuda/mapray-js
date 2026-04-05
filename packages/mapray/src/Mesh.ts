@@ -179,14 +179,43 @@ class Mesh {
      */
     draw( material: Material )
     {
+        if ( this._disposed ) {
+            return;
+        }
+
         const gl = this._glenv.context;
+        const live_attrib_data: AttribData = {};
+
+        for ( const key in this._attrib_data ) {
+            const entry = this._attrib_data[key];
+            if ( !entry ) {
+                continue;
+            }
+
+            const buffer = (entry.mesh_buffer as any).handle as WebGLBuffer | null;
+            if ( buffer === null ) {
+                this._warnMissingBuffer( `attribute:${key}` );
+                return;
+            }
+
+            live_attrib_data[key] = {
+                ...entry,
+                buffer,
+            };
+        }
 
         // 頂点属性のバインド
-        material.bindVertexAttribs( this._attrib_data );
+        material.bindVertexAttribs( live_attrib_data );
 
         const index_data = this._index_data;
         if ( index_data !== null ) {
-            gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, index_data.buffer );
+            const index_buffer = (index_data.mesh_buffer as any).handle as WebGLBuffer | null;
+            if ( index_buffer === null ) {
+                this._warnMissingBuffer( "index" );
+                return;
+            }
+
+            gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, index_buffer );
             gl.drawElements( this._draw_mode, index_data.num_indices, index_data.type, index_data.byte_offset );
         }
         else {
@@ -207,12 +236,24 @@ class Mesh {
     }
 
 
+    private _warnMissingBuffer( kind: string ): void
+    {
+        if ( this._warned_missing_buffer ) {
+            return;
+        }
+
+        this._warned_missing_buffer = true;
+        console.warn( `Skipping mesh draw because ${kind} buffer is no longer available.` );
+    }
+
+
     private readonly _glenv:        GLEnv;
     private readonly _draw_mode:    GLenum;
     private readonly _num_vertices: number;
     private readonly _attrib_data:  AttribData;
     private readonly _index_data:   IndexData | null;
     private _disposed: boolean = false;
+    private _warned_missing_buffer: boolean = false;
 
 }
 

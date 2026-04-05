@@ -107,16 +107,7 @@
     <div id="mapray-container">
         <div id="tools"></div>
     </div>
-    <script type="text/javascript">
-        var createDracoDecoderModule = window.createDracoDecoderModule || function() {
-            throw new Error("Draco decoder is not available in this debug build.");
-        };
-        var dracoDecoderWasm = window.dracoDecoderWasm || "";
-
-        window.createDracoDecoderModule = createDracoDecoderModule;
-        window.dracoDecoderWasm = dracoDecoderWasm;
-    </script>
-    <script type="text/javascript" src="./dist/bundle.js"></script>
+    <script type="text/javascript" src="./dist/bundle.js?v=20260405j"></script>
     <script type="text/javascript">
         (function() {
             if ( typeof window.startApp === "function" ) {

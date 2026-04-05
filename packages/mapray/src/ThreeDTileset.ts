@@ -11,16 +11,38 @@ import ModelContainer from "./ModelContainer";
 import EntityMaterial from "./EntityMaterial";
 import GltfTool from "./gltf/Tool";
 import WasmTool from "./WasmTool";
-import createDracoDecoderModule from "draco3d/draco_decoder_nodejs.js";
-import dracoDecoderWasm from "draco3d/draco_decoder.wasm";
 
 
 type ContentType = "gltf" | "glb" | "b3dm" | "i3dm" | "pnts" | "cmpt" | "external_tileset";
 type TileRefine = "ADD" | "REPLACE";
 
 let dracoDecoderModulePromise: Promise<any> | null = null;
+let dracoJsDecoderModulePromise: Promise<any> | null = null;
+let dracoMainThreadDecodeTail: Promise<void> = Promise.resolve();
+const dracoScriptLoadPromises = new Map<string, Promise<void>>();
+let warnedDracoMeshWorkerFallback = false;
+let warnedDracoJsFallbackDisable = false;
+let dracoJsFallbackDisabled = false;
 const temp_bounding_point = GeoMath.createVector3();
 const temp_bounding_center = GeoMath.createVector3();
+const THREE_D_TILES_MODULE_BASE_URL = (() => {
+    try {
+        const current_script =
+            typeof document !== "undefined" && document.currentScript instanceof HTMLScriptElement ?
+                document.currentScript.src :
+                null;
+        if ( current_script ) {
+            return new URL( ".", current_script ).toString();
+        }
+        if ( typeof window !== "undefined" && typeof window.location?.href === "string" ) {
+            return new URL( ".", window.location.href ).toString();
+        }
+        return null;
+    }
+    catch {
+        return null;
+    }
+})();
 const WGS84_FLATTENING = 1 / 298.257223563;
 const WGS84_SEMI_MAJOR_AXIS = 6378137.0;
 const WGS84_SEMI_MINOR_AXIS = WGS84_SEMI_MAJOR_AXIS * (1 - WGS84_FLATTENING);
@@ -276,6 +298,13 @@ interface PntsTransformWorkerResult {
 }
 
 
+interface DracoMeshWorkerResult {
+    vertexCount: number;
+    attributes: DracoMeshDecodeWorkerPool.WorkerAttributeResult[];
+    indices: DracoMeshDecodeWorkerPool.WorkerIndicesResult | null;
+}
+
+
 class PntsTransformWorkerPool {
 
     private readonly _workers: PntsTransformWorkerPool.Slot[];
@@ -441,6 +470,286 @@ export interface Slot {
 }
 
 
+class DracoMeshDecodeWorkerPool {
+
+    private readonly _workers: DracoMeshDecodeWorkerPool.Slot[];
+
+    private readonly _queue: DracoMeshDecodeWorkerPool.Pending[];
+
+    private _next_task_id: number;
+
+    private _broken: boolean;
+
+    private constructor( workers: DracoMeshDecodeWorkerPool.Slot[] )
+    {
+        this._workers = workers;
+        this._queue = [];
+        this._next_task_id = 1;
+        this._broken = false;
+    }
+
+
+    static create( worker_url: string | null, script_url: string | null, wasm_url: string | null, worker_count: number ): DracoMeshDecodeWorkerPool | null
+    {
+        if (
+            !worker_url ||
+            !script_url ||
+            !wasm_url ||
+            typeof window === "undefined" ||
+            typeof window.Worker === "undefined"
+        ) {
+            return null;
+        }
+
+        try {
+            const workers: DracoMeshDecodeWorkerPool.Slot[] = [];
+            const pool = new DracoMeshDecodeWorkerPool( workers );
+            for ( let i = 0; i < worker_count; ++i ) {
+                const worker = new window.Worker( worker_url );
+                const slot: DracoMeshDecodeWorkerPool.Slot = {
+                    worker,
+                    busy: true,
+                    ready: false,
+                };
+                worker.onmessage = event => pool._handleWorkerMessage( slot, event );
+                worker.onerror = event => pool._handleWorkerError( slot, event );
+                worker.postMessage( {
+                    type: "init",
+                    scriptUrl: script_url,
+                    wasmUrl: wasm_url,
+                } );
+                workers.push( slot );
+            }
+
+            return pool;
+        }
+        catch ( error ) {
+            console.warn( "Failed to create Draco mesh worker pool", error );
+            return null;
+        }
+    }
+
+
+    run(
+        payload: Omit<DracoMeshDecodeWorkerPool.WorkerRequest, "taskId">,
+        transferables: Transferable[]
+    ): Promise<DracoMeshWorkerResult>
+    {
+        return new Promise( ( resolve, reject ) => {
+            if ( this._broken ) {
+                reject( new Error( "Draco mesh worker pool is disabled after a fatal decode error" ) );
+                return;
+            }
+
+            this._queue.push( {
+                task_id: this._next_task_id++,
+                payload,
+                transferables,
+                resolve,
+                reject,
+            } );
+            this._dispatch();
+        } );
+    }
+
+
+    destroy(): void
+    {
+        this._broken = true;
+        for ( const slot of this._workers ) {
+            slot.worker.terminate();
+            if ( slot.pending ) {
+                slot.pending.reject( new Error( "Draco mesh worker pool was destroyed" ) );
+                slot.pending = undefined;
+            }
+        }
+
+        while ( this._queue.length > 0 ) {
+            this._queue.shift()!.reject( new Error( "Draco mesh worker pool was destroyed" ) );
+        }
+    }
+
+
+    private _dispatch(): void
+    {
+        if ( this._broken ) {
+            return;
+        }
+
+        for ( const slot of this._workers ) {
+            if ( !slot.ready || slot.busy || this._queue.length === 0 ) {
+                continue;
+            }
+
+            const pending = this._queue.shift()!;
+            slot.busy = true;
+            slot.pending = pending;
+
+            slot.worker.postMessage(
+                {
+                    type: "decodePrimitive",
+                    taskId: pending.task_id,
+                    ...pending.payload,
+                },
+                pending.transferables
+            );
+        }
+    }
+
+
+    private static _isFatalWorkerErrorMessage( message: string ): boolean
+    {
+        return /memory access out of bounds|table index is out of bounds/u.test( message );
+    }
+
+
+    private _handleWorkerMessage( slot: DracoMeshDecodeWorkerPool.Slot, event: MessageEvent<any> ): void
+    {
+        const data = event.data ?? {};
+
+        if ( data.type === "initResult" ) {
+            slot.busy = false;
+            if ( data.ok ) {
+                slot.ready = true;
+                this._dispatch();
+            }
+            else {
+                this._break( new Error( String( data.error || "Failed to initialize Draco mesh worker" ) ) );
+            }
+            return;
+        }
+
+        slot.busy = false;
+        const current = slot.pending;
+        slot.pending = undefined;
+
+        if ( !current ) {
+            this._dispatch();
+            return;
+        }
+
+        if ( data?.error ) {
+            const error = new Error( String( data.error ) );
+            if ( data?.fatal === true || DracoMeshDecodeWorkerPool._isFatalWorkerErrorMessage( error.message ) ) {
+                this._break( error );
+            }
+            current.reject( error );
+        }
+        else {
+            current.resolve( data.result as DracoMeshWorkerResult );
+        }
+
+        this._dispatch();
+    }
+
+
+    private _handleWorkerError( slot: DracoMeshDecodeWorkerPool.Slot, event: ErrorEvent ): void
+    {
+        slot.busy = false;
+        const error = event.error instanceof Error ? event.error : new Error( event.message || "Worker error" );
+        const current = slot.pending;
+        slot.pending = undefined;
+
+        if ( DracoMeshDecodeWorkerPool._isFatalWorkerErrorMessage( error.message ) ) {
+            this._break( error );
+        }
+
+        if ( current ) {
+            current.reject( error );
+        }
+
+        if ( !slot.ready ) {
+            this._break( error );
+        }
+
+        this._dispatch();
+    }
+
+
+    private _break( error: Error ): void
+    {
+        if ( this._broken ) {
+            return;
+        }
+
+        this._broken = true;
+        console.warn( "Disabling Draco mesh worker pool after fatal decode error", error );
+        for ( const slot of this._workers ) {
+            slot.worker.terminate();
+            slot.busy = false;
+            if ( slot.pending ) {
+                slot.pending = undefined;
+            }
+        }
+        while ( this._queue.length > 0 ) {
+            this._queue.shift()!.reject( new Error( "Draco mesh worker pool is disabled after a fatal decode error" ) );
+        }
+    }
+
+}
+
+
+namespace DracoMeshDecodeWorkerPool {
+
+export interface WorkerAttributeSpec {
+    semantic: string;
+    uniqueId: number;
+    accessorIndex: number;
+    accessorType: string;
+    componentType: number;
+    normalized: boolean;
+}
+
+
+export interface WorkerAttributeResult {
+    accessorIndex: number;
+    values: ThreeDTileset.NumericArray;
+    type: string;
+    componentType: number;
+    normalized: boolean;
+    min: number[] | null;
+    max: number[] | null;
+}
+
+
+export interface WorkerIndicesResult {
+    accessorIndex: number | null;
+    componentType: number;
+    values: Uint8Array | Uint16Array | Uint32Array;
+}
+
+
+export interface WorkerRequest {
+    taskId: number;
+    payload: ArrayBuffer;
+    bufferViewIndex: number;
+    primitiveMode: number;
+    attributes: WorkerAttributeSpec[];
+    indexAccessorIndex: number | null;
+    indexComponentType: number | null;
+}
+
+
+export interface Pending {
+    task_id: number;
+    payload: Omit<WorkerRequest, "taskId">;
+    transferables: Transferable[];
+    resolve: ( value: DracoMeshWorkerResult ) => void;
+    reject: ( error: Error ) => void;
+}
+
+
+export interface Slot {
+    worker: Worker;
+    busy: boolean;
+    ready: boolean;
+    pending?: Pending;
+}
+
+
+}
+
+
 /**
  * 3D Tiles tileset を描画するランタイム。
  *
@@ -478,6 +787,14 @@ class ThreeDTileset {
     private readonly _mesh_ref_counts: Map<Mesh, number>;
 
     private readonly _pnts_worker_pool: PntsTransformWorkerPool | null;
+
+    private readonly _draco_mesh_worker_pool: DracoMeshDecodeWorkerPool | null;
+
+    private readonly _draco_decoder_script_url: string | null;
+
+    private readonly _draco_decoder_js_url: string | null;
+
+    private readonly _draco_decoder_wasm_url: string | null;
 
     private readonly _opaque_primitives: Primitive[];
 
@@ -529,6 +846,27 @@ class ThreeDTileset {
         this._model_primitive_cache = new Map();
         this._cache_retained_meshes = new Map();
         this._mesh_ref_counts = new Map();
+        const draco_decoder_script_url = ThreeDTileset._resolveBrowserUrl(
+            options.dracoDecoderScriptUrl ??
+            ThreeDTileset._getGlobalString( "dracoDecoderScriptUrl" ) ??
+            ThreeDTileset._getGlobalString( "dracoDecoderScript" ) ??
+            ThreeDTileset._getDefaultBrowserAssetUrl( "vendor/draco_wasm_wrapper.js" )
+        );
+        this._draco_decoder_script_url = draco_decoder_script_url;
+        const draco_decoder_wasm_url = ThreeDTileset._resolveBrowserUrl(
+            options.dracoDecoderWasmUrl ??
+            ThreeDTileset._getGlobalString( "dracoDecoderWasmUrl" ) ??
+            ThreeDTileset._getGlobalString( "dracoDecoderWasm" ) ??
+            ThreeDTileset._getDefaultBrowserAssetUrl( "vendor/draco_decoder.wasm" )
+        );
+        this._draco_decoder_wasm_url = draco_decoder_wasm_url;
+        const draco_decoder_worker_url = ThreeDTileset._resolveBrowserUrl(
+            options.dracoDecoderWorkerUrl ?? ThreeDTileset._getGlobalString( "dracoDecoderWorkerUrl" )
+        );
+        this._draco_decoder_js_url = ThreeDTileset._resolveBrowserUrl(
+            options.dracoDecoderJsUrl ??
+            ThreeDTileset._getGlobalString( "dracoDecoderJsUrl" )
+        );
         this._pnts_worker_pool = PntsTransformWorkerPool.create(
             Math.max(
                 1,
@@ -540,6 +878,21 @@ class ThreeDTileset {
                             Math.max( 1, navigator.hardwareConcurrency - 1 ) :
                             1
                     )
+                )
+            )
+        );
+        this._draco_mesh_worker_pool = DracoMeshDecodeWorkerPool.create(
+            draco_decoder_worker_url,
+            draco_decoder_script_url,
+            draco_decoder_wasm_url,
+            Math.max(
+                1,
+                Math.min(
+                    2,
+                    this._max_concurrent_requests,
+                    typeof navigator !== "undefined" && Number.isFinite( navigator.hardwareConcurrency ) ?
+                        Math.max( 1, navigator.hardwareConcurrency - 1 ) :
+                        1
                 )
             )
         );
@@ -1284,7 +1637,11 @@ class ThreeDTileset {
             catch ( error ) {
                 const err = error instanceof Error ? error : new Error( String( error ) );
                 console.error( err );
+                if ( this._load_error === null ) {
+                    this._load_error = err;
+                }
                 tile.content_state = ThreeDTileset.ContentState.FAILED;
+                this._markFrameCacheDirty();
             }
             finally {
                 this._active_requests -= 1;
@@ -1513,11 +1870,21 @@ class ThreeDTileset {
         binary_chunk?: Uint8Array
     ): Promise<Primitive[]>
     {
-        const content = await GltfTool.load( gltf_json, {
+        const resolved_rtc = ThreeDTileset._resolveCesiumRtcExtension( gltf_json );
+        const resolved_gltf = await ThreeDTileset._resolveDracoMeshCompression(
+            resolved_rtc.json,
+            base_resource,
+            binary_chunk,
+            this._draco_mesh_worker_pool,
+            this._draco_decoder_js_url,
+            this._draco_decoder_script_url,
+            this._draco_decoder_wasm_url
+        );
+        const content = await GltfTool.load( resolved_gltf.json, {
             base_resource,
             binary_type: Resource.Type.BINARY,
             image_type: Resource.Type.IMAGE,
-            binary_chunk,
+            binary_chunk: resolved_gltf.binary_chunk,
             supported_extensions: ModelContainer.getSupportedExtensions_glTF(),
         } as any );
 
@@ -1526,7 +1893,1002 @@ class ThreeDTileset {
         }
 
         const container = new ModelContainer( this._viewer.scene, content );
-        return container.createPrimitives( undefined, { ridMaterial: false } ) ?? [];
+        const primitives = container.createPrimitives( undefined, { ridMaterial: false } ) ?? [];
+
+        if ( resolved_rtc.rtc_transform ) {
+            ThreeDTileset._applyTransformToPrimitives( primitives, resolved_rtc.rtc_transform );
+        }
+
+        return primitives;
+    }
+
+
+    private static _resolveCesiumRtcExtension( gltf_json: object ): { json: object; rtc_transform: Matrix | null }
+    {
+        const source = gltf_json as any;
+        const rtc_center = source?.extensions?.CESIUM_RTC?.center;
+
+        if (
+            !Array.isArray( rtc_center ) ||
+            rtc_center.length < 3 ||
+            !rtc_center.every( ( value: unknown ) => Number.isFinite( Number( value ) ) )
+        ) {
+            return { json: gltf_json, rtc_transform: null };
+        }
+
+        const cloned = JSON.parse( JSON.stringify( gltf_json ) );
+        if ( Array.isArray( cloned.extensionsUsed ) ) {
+            cloned.extensionsUsed = cloned.extensionsUsed.filter( (name: string) => name !== "CESIUM_RTC" );
+            if ( cloned.extensionsUsed.length === 0 ) {
+                delete cloned.extensionsUsed;
+            }
+        }
+        if ( Array.isArray( cloned.extensionsRequired ) ) {
+            cloned.extensionsRequired = cloned.extensionsRequired.filter( (name: string) => name !== "CESIUM_RTC" );
+            if ( cloned.extensionsRequired.length === 0 ) {
+                delete cloned.extensionsRequired;
+            }
+        }
+        if ( cloned.extensions && typeof cloned.extensions === "object" ) {
+            delete cloned.extensions.CESIUM_RTC;
+            if ( Object.keys( cloned.extensions ).length === 0 ) {
+                delete cloned.extensions;
+            }
+        }
+
+        const rtc_transform = GeoMath.setIdentity( GeoMath.createMatrix() );
+        rtc_transform[12] = Number( rtc_center[0] );
+        rtc_transform[13] = Number( rtc_center[1] );
+        rtc_transform[14] = Number( rtc_center[2] );
+
+        return { json: cloned, rtc_transform };
+    }
+
+
+    private static async _resolveDracoMeshCompression(
+        gltf_json: object,
+        base_resource: Resource,
+        binary_chunk?: Uint8Array,
+        worker_pool?: DracoMeshDecodeWorkerPool | null,
+        js_decoder_url?: string | null,
+        wasm_script_url?: string | null,
+        wasm_decoder_url?: string | null
+    ): Promise<{ json: object; binary_chunk?: Uint8Array }>
+    {
+        const source = gltf_json as any;
+        if ( !Array.isArray( source.meshes ) ) {
+            return { json: gltf_json, binary_chunk };
+        }
+
+        const has_draco_mesh = source.meshes.some( (mesh: any) => (
+            Array.isArray( mesh?.primitives ) &&
+            mesh.primitives.some( (primitive: any) => primitive?.extensions?.KHR_draco_mesh_compression )
+        ) );
+        if ( !has_draco_mesh ) {
+            return { json: gltf_json, binary_chunk };
+        }
+
+        const cloned = JSON.parse( JSON.stringify( gltf_json ) );
+        cloned.buffers = Array.isArray( cloned.buffers ) ? cloned.buffers : [];
+        cloned.bufferViews = Array.isArray( cloned.bufferViews ) ? cloned.bufferViews : [];
+        cloned.accessors = Array.isArray( cloned.accessors ) ? cloned.accessors : [];
+
+        const buffer_cache = new Map<number, Promise<Uint8Array>>();
+        const storage = ThreeDTileset._createDracoDecodedBufferStorage( cloned, binary_chunk );
+
+        for ( const mesh of cloned.meshes ) {
+            if ( !Array.isArray( mesh?.primitives ) ) {
+                continue;
+            }
+
+            for ( const primitive of mesh.primitives ) {
+                if ( !primitive?.extensions?.KHR_draco_mesh_compression ) {
+                    continue;
+                }
+
+                const decoded = await ThreeDTileset._decodeDracoMeshPrimitive(
+                    cloned,
+                    primitive,
+                    base_resource,
+                    binary_chunk,
+                    buffer_cache,
+                    worker_pool,
+                    js_decoder_url,
+                    wasm_script_url,
+                    wasm_decoder_url
+                );
+
+                for ( const attribute of decoded.attributes ) {
+                    const buffer_view = ThreeDTileset._appendDecodedBufferView(
+                        cloned,
+                        storage,
+                        attribute.values,
+                        MeshBuffer.Target.ATTRIBUTE
+                    );
+                    const accessor = cloned.accessors[attribute.accessor_index];
+                    accessor.bufferView = buffer_view;
+                    accessor.byteOffset = 0;
+                    accessor.count = decoded.vertex_count;
+                    accessor.type = attribute.type;
+                    accessor.componentType = attribute.component_type;
+
+                    if ( attribute.normalized ) accessor.normalized = true;
+                    else delete accessor.normalized;
+
+                    if ( attribute.min && attribute.max ) {
+                        accessor.min = attribute.min;
+                        accessor.max = attribute.max;
+                    }
+                    else {
+                        delete accessor.min;
+                        delete accessor.max;
+                    }
+                }
+
+                if ( decoded.indices ) {
+                    const buffer_view = ThreeDTileset._appendDecodedBufferView(
+                        cloned,
+                        storage,
+                        decoded.indices.values,
+                        MeshBuffer.Target.INDEX
+                    );
+                    const accessor_index =
+                        decoded.indices.accessor_index ?? cloned.accessors.push( {} ) - 1;
+                    const accessor = cloned.accessors[accessor_index];
+
+                    accessor.bufferView = buffer_view;
+                    accessor.byteOffset = 0;
+                    accessor.count = decoded.indices.values.length;
+                    accessor.type = "SCALAR";
+                    accessor.componentType = decoded.indices.component_type;
+                    delete accessor.normalized;
+                    delete accessor.min;
+                    delete accessor.max;
+
+                    primitive.indices = accessor_index;
+                }
+                else {
+                    delete primitive.indices;
+                    primitive.mode = 0;
+                }
+
+                if ( decoded.indices && primitive.mode === 5 ) {
+                    // Draco decodes mesh connectivity as triangles, so normalize the primitive mode.
+                    primitive.mode = 4;
+                }
+
+                ThreeDTileset._removePrimitiveExtension( primitive, "KHR_draco_mesh_compression" );
+            }
+        }
+
+        ThreeDTileset._removeGlobalExtension( cloned, "KHR_draco_mesh_compression" );
+
+        const resolved_binary_chunk = ThreeDTileset._finalizeDracoDecodedBufferStorage( cloned, storage, binary_chunk );
+        return {
+            json: cloned,
+            binary_chunk: resolved_binary_chunk,
+        };
+    }
+
+
+    private static _createDracoDecodedBufferStorage(
+        gltf_json: any,
+        binary_chunk?: Uint8Array
+    ): ThreeDTileset.GltfBufferStorage
+    {
+        let buffer_index = -1;
+        let use_binary_chunk = false;
+        let current_offset = 0;
+
+        if ( binary_chunk ) {
+            buffer_index = gltf_json.buffers.findIndex( (buffer: any) => buffer && buffer.uri === undefined );
+            if ( buffer_index >= 0 ) {
+                use_binary_chunk = true;
+                current_offset = binary_chunk.byteLength;
+                gltf_json.buffers[buffer_index].byteLength = Math.max(
+                    Number( gltf_json.buffers[buffer_index].byteLength ) || 0,
+                    binary_chunk.byteLength
+                );
+            }
+        }
+
+        if ( buffer_index < 0 ) {
+            buffer_index = gltf_json.buffers.length;
+            gltf_json.buffers.push( { byteLength: 0, uri: "" } );
+        }
+
+        return {
+            buffer_index,
+            current_offset,
+            use_binary_chunk,
+            parts: [],
+        };
+    }
+
+
+    private static _appendDecodedBufferView(
+        gltf_json: any,
+        storage: ThreeDTileset.GltfBufferStorage,
+        values: ArrayBufferView,
+        target: MeshBuffer.Target
+    ): number
+    {
+        const padding = (4 - (storage.current_offset % 4)) % 4;
+        if ( padding > 0 ) {
+            storage.parts.push( new Uint8Array( padding ) );
+            storage.current_offset += padding;
+        }
+
+        const bytes = ThreeDTileset._toUint8Array( values );
+        const byte_offset = storage.current_offset;
+
+        storage.parts.push( bytes );
+        storage.current_offset += bytes.byteLength;
+
+        gltf_json.bufferViews.push( {
+            buffer: storage.buffer_index,
+            byteOffset: byte_offset,
+            byteLength: bytes.byteLength,
+            target,
+        } );
+
+        return gltf_json.bufferViews.length - 1;
+    }
+
+
+    private static _finalizeDracoDecodedBufferStorage(
+        gltf_json: any,
+        storage: ThreeDTileset.GltfBufferStorage,
+        binary_chunk?: Uint8Array
+    ): Uint8Array | undefined
+    {
+        const tail_padding = (4 - (storage.current_offset % 4)) % 4;
+        if ( tail_padding > 0 ) {
+            storage.parts.push( new Uint8Array( tail_padding ) );
+            storage.current_offset += tail_padding;
+        }
+
+        if ( storage.use_binary_chunk ) {
+            const original = binary_chunk ?? new Uint8Array();
+            const merged = new Uint8Array( storage.current_offset );
+            merged.set( original, 0 );
+
+            let write_offset = original.byteLength;
+            for ( const part of storage.parts ) {
+                merged.set( part, write_offset );
+                write_offset += part.byteLength;
+            }
+
+            const buffer = gltf_json.buffers[storage.buffer_index];
+            buffer.byteLength = merged.byteLength;
+            delete buffer.uri;
+            return merged;
+        }
+
+        let packed_length = 0;
+        for ( const part of storage.parts ) {
+            packed_length += part.byteLength;
+        }
+
+        const packed = new Uint8Array( packed_length );
+        let write_offset = 0;
+        for ( const part of storage.parts ) {
+            packed.set( part, write_offset );
+            write_offset += part.byteLength;
+        }
+
+        const buffer = gltf_json.buffers[storage.buffer_index];
+        buffer.byteLength = packed.byteLength;
+        buffer.uri = ThreeDTileset._createBinaryDataUri( packed );
+        return binary_chunk;
+    }
+
+
+    private static _removePrimitiveExtension( primitive: any, extension_name: string ): void
+    {
+        if ( primitive?.extensions && typeof primitive.extensions === "object" ) {
+            delete primitive.extensions[extension_name];
+            if ( Object.keys( primitive.extensions ).length === 0 ) {
+                delete primitive.extensions;
+            }
+        }
+    }
+
+
+    private static _removeGlobalExtension( gltf_json: any, extension_name: string ): void
+    {
+        if ( Array.isArray( gltf_json.extensionsUsed ) ) {
+            gltf_json.extensionsUsed = gltf_json.extensionsUsed.filter( (name: string) => name !== extension_name );
+            if ( gltf_json.extensionsUsed.length === 0 ) {
+                delete gltf_json.extensionsUsed;
+            }
+        }
+
+        if ( Array.isArray( gltf_json.extensionsRequired ) ) {
+            gltf_json.extensionsRequired = gltf_json.extensionsRequired.filter( (name: string) => name !== extension_name );
+            if ( gltf_json.extensionsRequired.length === 0 ) {
+                delete gltf_json.extensionsRequired;
+            }
+        }
+    }
+
+
+    private static async _decodeDracoMeshPrimitive(
+        gltf_json: any,
+        primitive: any,
+        base_resource: Resource,
+        binary_chunk: Uint8Array | undefined,
+        buffer_cache: Map<number, Promise<Uint8Array>>,
+        worker_pool?: DracoMeshDecodeWorkerPool | null,
+        js_decoder_url?: string | null,
+        wasm_script_url?: string | null,
+        wasm_decoder_url?: string | null
+    ): Promise<ThreeDTileset.DecodedDracoMeshPrimitive>
+    {
+        const extension = primitive?.extensions?.KHR_draco_mesh_compression;
+        if ( typeof extension !== "object" || extension === null ) {
+            throw new Error( "Invalid KHR_draco_mesh_compression extension" );
+        }
+
+        const buffer_view_index = Number( extension.bufferView );
+        if ( !Number.isFinite( buffer_view_index ) || buffer_view_index < 0 ) {
+            throw new Error( "Invalid Draco mesh bufferView" );
+        }
+
+        const payload = await ThreeDTileset._loadGltfBufferView(
+            gltf_json,
+            buffer_view_index,
+            base_resource,
+            binary_chunk,
+            buffer_cache
+        );
+        const payload_bytes = new Uint8Array( payload.byteLength );
+        payload_bytes.set( payload );
+        const primitive_mode = Number.isFinite( Number( primitive?.mode ) ) ? Number( primitive.mode ) : 4;
+
+        if ( worker_pool ) {
+            const worker_attribute_specs = ThreeDTileset._createDracoMeshWorkerAttributeSpecs( gltf_json, primitive, extension.attributes );
+            const index_accessor_index = typeof primitive.indices === "number" ? primitive.indices : null;
+            const index_accessor =
+                index_accessor_index !== null ?
+                    gltf_json.accessors[index_accessor_index] :
+                    null;
+            try {
+                const worker_payload = new Uint8Array( payload_bytes );
+                const decoded = await worker_pool.run(
+                    {
+                        payload: worker_payload.buffer,
+                        bufferViewIndex: buffer_view_index,
+                        primitiveMode: primitive_mode,
+                        attributes: worker_attribute_specs,
+                        indexAccessorIndex: index_accessor_index,
+                        indexComponentType: index_accessor?.componentType ?? null,
+                    },
+                    [worker_payload.buffer]
+                );
+
+                return {
+                    vertex_count: decoded.vertexCount,
+                    attributes: decoded.attributes.map( attribute => ( {
+                        accessor_index: attribute.accessorIndex,
+                        values: attribute.values,
+                        type: attribute.type,
+                        component_type: attribute.componentType,
+                        normalized: attribute.normalized,
+                        min: attribute.min,
+                        max: attribute.max,
+                    } ) ),
+                    indices: decoded.indices ? {
+                        accessor_index: decoded.indices.accessorIndex,
+                        component_type: decoded.indices.componentType,
+                        values: decoded.indices.values,
+                    } : null,
+                };
+            }
+            catch ( error ) {
+                if ( !warnedDracoMeshWorkerFallback ) {
+                    warnedDracoMeshWorkerFallback = true;
+                    console.warn( "Draco mesh worker decode failed; falling back to main-thread decode", error );
+                }
+            }
+        }
+
+        const wasm_error = await ThreeDTileset._runMainThreadDracoDecode( async () => {
+            let last_error: unknown = null;
+
+            for ( let attempt = 0; attempt < 2; ++attempt ) {
+                try {
+                    const module = await ThreeDTileset._getDracoDecoderModule( "wasm", wasm_script_url, wasm_decoder_url );
+                    return await ThreeDTileset._decodeDracoMeshPrimitiveWithModule(
+                        module,
+                        gltf_json,
+                        primitive,
+                        buffer_view_index,
+                        primitive_mode,
+                        payload_bytes,
+                        extension
+                    );
+                }
+                catch ( error ) {
+                    last_error = error;
+                    if ( attempt === 0 && ThreeDTileset._shouldResetDracoDecoderModule( error ) ) {
+                        ThreeDTileset._resetDracoDecoderModule( "wasm" );
+                        continue;
+                    }
+                    break;
+                }
+            }
+
+            throw last_error;
+        } ).catch( error => error );
+
+        if ( !(wasm_error instanceof Error) && !(wasm_error instanceof WebAssembly.RuntimeError) ) {
+            return wasm_error as ThreeDTileset.DecodedDracoMeshPrimitive;
+        }
+
+        if ( ThreeDTileset._isFatalDracoRuntimeError( wasm_error ) && js_decoder_url && !dracoJsFallbackDisabled ) {
+            try {
+                const module = await ThreeDTileset._getDracoDecoderModule( "js", js_decoder_url, wasm_decoder_url );
+                return await ThreeDTileset._decodeDracoMeshPrimitiveWithModule(
+                    module,
+                    gltf_json,
+                    primitive,
+                    buffer_view_index,
+                    primitive_mode,
+                    payload_bytes,
+                    extension
+                );
+            }
+            catch ( js_error ) {
+                if ( ThreeDTileset._isBrokenDracoJsFallbackError( js_error ) ) {
+                    dracoJsFallbackDisabled = true;
+                    ThreeDTileset._resetDracoDecoderModule( "js" );
+                    if ( !warnedDracoJsFallbackDisable ) {
+                        warnedDracoJsFallbackDisable = true;
+                        console.warn( "Disabling Draco JS fallback after decoder failure", js_error );
+                    }
+                }
+                throw wasm_error ?? js_error;
+            }
+        }
+
+        throw wasm_error;
+    }
+
+
+    private static async _decodeDracoMeshPrimitiveWithModule(
+        module: any,
+        gltf_json: any,
+        primitive: any,
+        buffer_view_index: number,
+        primitive_mode: number,
+        payload_bytes: Uint8Array,
+        extension: any
+    ): Promise<ThreeDTileset.DecodedDracoMeshPrimitive>
+    {
+        const decoder = new module.Decoder();
+        const buffer = new module.DecoderBuffer();
+        let status: any = null;
+        let buffer_initialized = false;
+        let geometry: any = null;
+        let geometry_type: number | null = null;
+        let geometry_destroyable = false;
+        let fatal_decode_error = false;
+
+        try {
+            buffer.Init( payload_bytes, payload_bytes.byteLength );
+            buffer_initialized = true;
+
+            geometry_type = decoder.GetEncodedGeometryType( buffer );
+            if ( geometry_type === module.TRIANGULAR_MESH ) {
+                geometry = new module.Mesh();
+                status = decoder.DecodeBufferToMesh( buffer, geometry );
+            }
+            else if ( geometry_type === module.POINT_CLOUD ) {
+                geometry = new module.PointCloud();
+                status = decoder.DecodeBufferToPointCloud( buffer, geometry );
+            }
+            else {
+                throw new Error( "Unsupported Draco glTF geometry type" );
+            }
+
+            if ( !status.ok() || geometry.ptr === 0 ) {
+                const error_message = typeof status.error_msg === "function" ? status.error_msg() : "unknown error";
+                const geometry_label =
+                    geometry_type === module.TRIANGULAR_MESH ? "TRIANGULAR_MESH" :
+                    geometry_type === module.POINT_CLOUD ? "POINT_CLOUD" :
+                    String( geometry_type );
+                throw new Error(
+                    `Failed to decode Draco mesh payload: ${error_message} ` +
+                    `(bufferView=${buffer_view_index}, primitiveMode=${primitive_mode}, geometryType=${geometry_label})`
+                );
+            }
+            geometry_destroyable = true;
+
+            const vertex_count = geometry.num_points();
+            const attributes: ThreeDTileset.DecodedDracoMeshAttribute[] = [];
+            const extension_attributes = extension.attributes;
+            if ( typeof extension_attributes !== "object" || extension_attributes === null ) {
+                throw new Error( "Invalid Draco mesh attributes" );
+            }
+
+            for ( const semantic of Object.keys( extension_attributes ) ) {
+                const accessor_index = primitive?.attributes?.[semantic];
+                if ( !Number.isFinite( Number( accessor_index ) ) || accessor_index < 0 ) {
+                    throw new Error( "Missing accessor for Draco mesh attribute: " + semantic );
+                }
+
+                const accessor = gltf_json.accessors[accessor_index];
+                if ( typeof accessor !== "object" || accessor === null ) {
+                    throw new Error( "Invalid accessor for Draco mesh attribute: " + semantic );
+                }
+
+                const values = ThreeDTileset._decodeDracoMeshAttribute(
+                    module,
+                    decoder,
+                    geometry,
+                    ThreeDTileset._getDracoPropertyUniqueId( extension_attributes, semantic ) as number,
+                    accessor,
+                    semantic
+                );
+
+                const min_max = semantic === "POSITION" ?
+                    ThreeDTileset._calculateAccessorMinMax( values, vertex_count, ThreeDTileset._getAccessorComponentCount( accessor.type ) ) :
+                    null;
+
+                attributes.push( {
+                    accessor_index,
+                    values,
+                    type: accessor.type,
+                    component_type: accessor.componentType,
+                    normalized: accessor.normalized === true,
+                    min: min_max?.min ?? null,
+                    max: min_max?.max ?? null,
+                } );
+            }
+
+            const indices = geometry_type === module.TRIANGULAR_MESH ?
+                (() => {
+                    const index_accessor_index = typeof primitive.indices === "number" ? primitive.indices : undefined;
+                    const index_accessor =
+                        index_accessor_index !== undefined ?
+                            gltf_json.accessors[index_accessor_index] :
+                            null;
+                    return ThreeDTileset._decodeDracoMeshIndices(
+                        module,
+                        decoder,
+                        geometry,
+                        index_accessor_index,
+                        index_accessor?.componentType
+                    );
+                })() :
+                null;
+
+            return {
+                vertex_count,
+                attributes,
+                indices,
+            };
+        }
+        catch ( error ) {
+            fatal_decode_error = error instanceof WebAssembly.RuntimeError;
+            throw error;
+        }
+        finally {
+            void status;
+            if ( buffer_initialized ) {
+                try {
+                    module.destroy( buffer );
+                }
+                catch ( error ) {
+                    if ( !ThreeDTileset._isFatalDracoRuntimeError( error ) ) {
+                        console.warn( "Failed to destroy Draco buffer object", error );
+                    }
+                }
+            }
+            if ( geometry && geometry_destroyable && !fatal_decode_error ) {
+                try {
+                    module.destroy( geometry );
+                }
+                catch ( error ) {
+                    if ( !ThreeDTileset._isFatalDracoRuntimeError( error ) ) {
+                        console.warn( "Failed to destroy Draco geometry object", error );
+                    }
+                }
+            }
+            if ( !fatal_decode_error ) {
+                try {
+                    module.destroy( decoder );
+                }
+                catch ( error ) {
+                    if ( !ThreeDTileset._isFatalDracoRuntimeError( error ) ) {
+                        console.warn( "Failed to destroy Draco decoder object", error );
+                    }
+                }
+            }
+        }
+    }
+
+
+    private static async _loadGltfBufferView(
+        gltf_json: any,
+        buffer_view_index: number,
+        base_resource: Resource,
+        binary_chunk: Uint8Array | undefined,
+        buffer_cache: Map<number, Promise<Uint8Array>>
+    ): Promise<Uint8Array>
+    {
+        const buffer_view = gltf_json?.bufferViews?.[buffer_view_index];
+        if ( typeof buffer_view !== "object" || buffer_view === null ) {
+            throw new Error( "Invalid glTF bufferView index: " + buffer_view_index );
+        }
+
+        const buffer_index = Number( buffer_view.buffer );
+        const byte_offset = Number( buffer_view.byteOffset ?? 0 );
+        const byte_length = Number( buffer_view.byteLength );
+        if (
+            !Number.isFinite( buffer_index ) ||
+            !Number.isFinite( byte_offset ) ||
+            !Number.isFinite( byte_length ) ||
+            buffer_index < 0 ||
+            byte_offset < 0 ||
+            byte_length < 0
+        ) {
+            throw new Error( "Invalid glTF bufferView layout for Draco mesh" );
+        }
+
+        const buffer = await ThreeDTileset._loadGltfBuffer(
+            gltf_json,
+            buffer_index,
+            base_resource,
+            binary_chunk,
+            buffer_cache
+        );
+
+        if ( byte_offset + byte_length > buffer.byteLength ) {
+            throw new Error( "Invalid glTF Draco bufferView range" );
+        }
+
+        const view = buffer.subarray( byte_offset, byte_offset + byte_length );
+        const copied = new Uint8Array( view.byteLength );
+        copied.set( view );
+        return copied;
+    }
+
+
+    private static async _loadGltfBuffer(
+        gltf_json: any,
+        buffer_index: number,
+        base_resource: Resource,
+        binary_chunk: Uint8Array | undefined,
+        buffer_cache: Map<number, Promise<Uint8Array>>
+    ): Promise<Uint8Array>
+    {
+        let promise = buffer_cache.get( buffer_index );
+        if ( promise !== undefined ) {
+            return await promise;
+        }
+
+        promise = (async() => {
+            const buffer = gltf_json?.buffers?.[buffer_index];
+            if ( typeof buffer !== "object" || buffer === null ) {
+                throw new Error( "Invalid glTF buffer index: " + buffer_index );
+            }
+
+            const byte_length = Number( buffer.byteLength );
+            if ( !Number.isFinite( byte_length ) || byte_length < 0 ) {
+                throw new Error( "Invalid glTF buffer byteLength: " + buffer_index );
+            }
+
+            if ( typeof buffer.uri === "string" ) {
+                if ( buffer.uri.startsWith( "data:" ) ) {
+                    return ThreeDTileset._decodeDataUri( buffer.uri );
+                }
+                if ( !base_resource.loadSubResourceSupported() ) {
+                    throw new Error( "Sub resource is not supported for Draco glTF buffer" );
+                }
+                return new Uint8Array( await base_resource.loadSubResourceAsBinary( buffer.uri ) );
+            }
+
+            if ( !binary_chunk ) {
+                throw new Error( "GLB binary chunk is missing for Draco mesh" );
+            }
+
+            if ( byte_length > binary_chunk.byteLength ) {
+                throw new Error( "Invalid GLB binary chunk length for Draco mesh" );
+            }
+
+            return binary_chunk.subarray( 0, byte_length );
+        })();
+
+        buffer_cache.set( buffer_index, promise );
+        return await promise;
+    }
+
+
+    private static _decodeDracoMeshAttribute(
+        module: any,
+        decoder: any,
+        mesh: any,
+        unique_id: number,
+        accessor: any,
+        name: string
+    ): ThreeDTileset.NumericArray
+    {
+        const components = ThreeDTileset._getAccessorComponentCount( accessor.type );
+        const component_info = ThreeDTileset._getComponentTypeInfo( module, accessor.componentType );
+        const count = mesh.num_points();
+
+        if ( typeof decoder.GetAttributeDataArrayForAllPoints === "function" && typeof module._malloc === "function" ) {
+            const attribute = ThreeDTileset._getDracoAttribute( module, decoder, mesh, unique_id, components, name );
+            const byte_length = count * components * component_info.bytes;
+            const pointer = module._malloc( byte_length );
+
+            try {
+                if ( !decoder.GetAttributeDataArrayForAllPoints( mesh, attribute, component_info.draco_data_type, byte_length, pointer ) ) {
+                    throw new Error( "Failed to decode Draco mesh attribute: " + name );
+                }
+
+                const heap_view = new component_info.typed_array( module.HEAPU8.buffer, pointer, count * components );
+                const values = new component_info.typed_array( count * components );
+                values.set( heap_view );
+                return values;
+            }
+            finally {
+                module._free( pointer );
+                module.destroy( attribute );
+            }
+        }
+
+        const decoded = ThreeDTileset._decodeDracoRawAttribute( module, decoder, mesh, unique_id, components, name );
+        return ThreeDTileset._convertDracoAttributeValues(
+            decoded.values,
+            accessor.componentType,
+            accessor.normalized === true,
+            name
+        );
+    }
+
+
+    private static _decodeDracoMeshIndices(
+        module: any,
+        decoder: any,
+        mesh: any,
+        accessor_index: number | undefined,
+        requested_component_type: number | undefined
+    ): ThreeDTileset.DecodedDracoMeshIndices
+    {
+        const face_count = mesh.num_faces();
+        const index_count = face_count * 3;
+        let values = new Uint32Array( index_count );
+
+        if ( typeof decoder.GetFaceFromMesh === "function" ) {
+            const face = new module.DracoInt32Array();
+            try {
+                for ( let i = 0; i < face_count; ++i ) {
+                    if ( !decoder.GetFaceFromMesh( mesh, i, face ) ) {
+                        throw new Error( "Failed to decode Draco mesh indices" );
+                    }
+                    values[3*i + 0] = face.GetValue( 0 );
+                    values[3*i + 1] = face.GetValue( 1 );
+                    values[3*i + 2] = face.GetValue( 2 );
+                }
+            }
+            finally {
+                module.destroy( face );
+            }
+        }
+        else if ( typeof decoder.GetTrianglesUInt32Array === "function" && typeof module._malloc === "function" ) {
+            const byte_length = index_count * Uint32Array.BYTES_PER_ELEMENT;
+            const pointer = module._malloc( byte_length );
+            try {
+                if ( !decoder.GetTrianglesUInt32Array( mesh, byte_length, pointer ) ) {
+                    throw new Error( "Failed to decode Draco mesh indices" );
+                }
+
+                const heap_view = new Uint32Array( module.HEAPU8.buffer, pointer, index_count );
+                values.set( heap_view );
+            }
+            finally {
+                module._free( pointer );
+            }
+        }
+        else {
+            throw new Error( "Draco decoder does not expose mesh index APIs" );
+        }
+
+        const max_index = values.length > 0 ? values.reduce( (max, value) => Math.max( max, value ), 0 ) : 0;
+        let component_type = Number.isFinite( Number( requested_component_type ) ) ? Number( requested_component_type ) : 5125;
+
+        if ( component_type !== 5121 && component_type !== 5123 && component_type !== 5125 ) {
+            component_type = 5125;
+        }
+
+        if ( component_type === 5121 && max_index > 255 ) {
+            component_type = max_index <= 65535 ? 5123 : 5125;
+        }
+        else if ( component_type === 5123 && max_index > 65535 ) {
+            component_type = 5125;
+        }
+        else if ( component_type === 5125 ) {
+            if ( max_index <= 255 ) component_type = 5121;
+            else if ( max_index <= 65535 ) component_type = 5123;
+        }
+
+        return {
+            accessor_index: typeof accessor_index === "number" ? accessor_index : null,
+            component_type,
+            values: ThreeDTileset._convertDracoAttributeValues( values, component_type, false, "indices" ) as Uint8Array | Uint16Array | Uint32Array,
+        };
+    }
+
+
+    private static _getAccessorComponentCount( accessor_type: string ): number
+    {
+        switch ( accessor_type ) {
+        case "SCALAR": return 1;
+        case "VEC2": return 2;
+        case "VEC3": return 3;
+        case "VEC4": return 4;
+        case "MAT2": return 4;
+        case "MAT3": return 9;
+        case "MAT4": return 16;
+        default:
+            throw new Error( "Unsupported accessor type: " + accessor_type );
+        }
+    }
+
+
+    private static _getComponentTypeInfo( module: any, component_type: number ): ThreeDTileset.ComponentTypeInfo
+    {
+        switch ( component_type ) {
+        case 5120: return { bytes: 1, draco_data_type: module.DT_INT8, typed_array: Int8Array, min: -128, max: 127, is_float: false, is_unsigned: false };
+        case 5121: return { bytes: 1, draco_data_type: module.DT_UINT8, typed_array: Uint8Array, min: 0, max: 255, is_float: false, is_unsigned: true };
+        case 5122: return { bytes: 2, draco_data_type: module.DT_INT16, typed_array: Int16Array, min: -32768, max: 32767, is_float: false, is_unsigned: false };
+        case 5123: return { bytes: 2, draco_data_type: module.DT_UINT16, typed_array: Uint16Array, min: 0, max: 65535, is_float: false, is_unsigned: true };
+        case 5125: return { bytes: 4, draco_data_type: module.DT_UINT32, typed_array: Uint32Array, min: 0, max: 4294967295, is_float: false, is_unsigned: true };
+        case 5126: return { bytes: 4, draco_data_type: module.DT_FLOAT32, typed_array: Float32Array, min: -Infinity, max: Infinity, is_float: true, is_unsigned: false };
+        default:
+            throw new Error( "Unsupported glTF component type: " + component_type );
+        }
+    }
+
+
+    private static _convertDracoAttributeValues(
+        values: ThreeDTileset.NumericArray,
+        component_type: number,
+        normalized: boolean,
+        name: string
+    ): ThreeDTileset.NumericArray
+    {
+        const info = ThreeDTileset._getComponentTypeInfo( {
+            DT_INT8: 0,
+            DT_UINT8: 0,
+            DT_INT16: 0,
+            DT_UINT16: 0,
+            DT_UINT32: 0,
+            DT_FLOAT32: 0,
+        }, component_type );
+
+        if ( values instanceof info.typed_array ) {
+            return values;
+        }
+
+        const converted = new info.typed_array( values.length ) as ThreeDTileset.NumericArray;
+        for ( let i = 0; i < values.length; ++i ) {
+            const value = Number( values[i] );
+            if ( !Number.isFinite( value ) ) {
+                throw new Error( "Invalid Draco value: " + name );
+            }
+
+            if ( info.is_float ) {
+                converted[i] = value;
+            }
+            else if ( normalized && values instanceof Float32Array ) {
+                converted[i] = ThreeDTileset._convertNormalizedFloatToInteger( value, info.min, info.max, info.is_unsigned );
+            }
+            else {
+                const rounded = Math.round( value );
+                if ( rounded < info.min || rounded > info.max ) {
+                    throw new Error( "Draco value is out of range for accessor: " + name );
+                }
+                converted[i] = rounded;
+            }
+        }
+
+        return converted;
+    }
+
+
+    private static _convertNormalizedFloatToInteger(
+        value: number,
+        min: number,
+        max: number,
+        is_unsigned: boolean
+    ): number
+    {
+        if ( is_unsigned ) {
+            return Math.round( Math.max( 0, Math.min( 1, value ) ) * max );
+        }
+
+        const clamped = Math.max( -1, Math.min( 1, value ) );
+        const scale = clamped < 0 ? -min : max;
+        return Math.round( clamped * scale );
+    }
+
+
+    private static _calculateAccessorMinMax(
+        values: ThreeDTileset.NumericArray,
+        count: number,
+        components: number
+    ): { min: number[]; max: number[] } | null
+    {
+        if ( count <= 0 || components <= 0 ) {
+            return null;
+        }
+
+        const min = new Array<number>( components ).fill( Number.POSITIVE_INFINITY );
+        const max = new Array<number>( components ).fill( Number.NEGATIVE_INFINITY );
+
+        for ( let i = 0; i < count; ++i ) {
+            for ( let c = 0; c < components; ++c ) {
+                const value = Number( values[components*i + c] );
+                if ( value < min[c] ) min[c] = value;
+                if ( value > max[c] ) max[c] = value;
+            }
+        }
+
+        return { min, max };
+    }
+
+
+    private static _toUint8Array( values: ArrayBufferView ): Uint8Array
+    {
+        return new Uint8Array( values.buffer.slice( values.byteOffset, values.byteOffset + values.byteLength ) );
+    }
+
+
+    private static _createBinaryDataUri( bytes: Uint8Array ): string
+    {
+        if ( typeof Buffer !== "undefined" ) {
+            return "data:application/octet-stream;base64," + Buffer.from( bytes ).toString( "base64" );
+        }
+
+        let binary = "";
+        for ( let i = 0; i < bytes.length; ++i ) {
+            binary += String.fromCharCode( bytes[i] );
+        }
+        return "data:application/octet-stream;base64," + btoa( binary );
+    }
+
+
+    private static _decodeDataUri( uri: string ): Uint8Array
+    {
+        const match = /^data:.*?(;base64)?,(.*)$/u.exec( uri );
+        if ( !match ) {
+            throw new Error( "Invalid data URI in glTF buffer" );
+        }
+
+        const payload = match[2];
+        if ( match[1] ) {
+            if ( typeof Buffer !== "undefined" ) {
+                return new Uint8Array( Buffer.from( payload, "base64" ) );
+            }
+
+            const binary = atob( payload );
+            const decoded = new Uint8Array( binary.length );
+            for ( let i = 0; i < binary.length; ++i ) {
+                decoded[i] = binary.charCodeAt( i );
+            }
+            return decoded;
+        }
+
+        const text = decodeURIComponent( payload );
+        const decoded = new Uint8Array( text.length );
+        for ( let i = 0; i < text.length; ++i ) {
+            decoded[i] = text.charCodeAt( i ) & 0xff;
+        }
+        return decoded;
     }
 
     private static _parseGlb( glb: ArrayBuffer ): ThreeDTileset.ParsedGlb
@@ -1589,17 +2951,41 @@ class ThreeDTileset {
         }
 
         const byte_length = dview.getUint32( 8, true );
-        const feature_json_length = dview.getUint32( 12, true );
-        const feature_binary_length = dview.getUint32( 16, true );
-        const batch_json_length = dview.getUint32( 20, true );
-        const batch_binary_length = dview.getUint32( 24, true );
-        const glb_offset = 28 + feature_json_length + feature_binary_length + batch_json_length + batch_binary_length;
+        let feature_json_length = dview.getUint32( 12, true );
+        let feature_binary_length = dview.getUint32( 16, true );
+        let batch_json_length = dview.getUint32( 20, true );
+        let batch_binary_length = dview.getUint32( 24, true );
+        let glb_offset = 28;
 
-        if ( byte_length > dview.byteLength || glb_offset > byte_length ) {
+        if ( batch_json_length >= 570425344 ) {
+            glb_offset -= 8;
+            batch_json_length = feature_binary_length;
+            batch_binary_length = 0;
+            feature_json_length = 0;
+            feature_binary_length = 0;
+        }
+        else if ( batch_binary_length >= 570425344 ) {
+            glb_offset -= 4;
+            batch_json_length = feature_json_length;
+            batch_binary_length = feature_binary_length;
+            feature_json_length = 0;
+            feature_binary_length = 0;
+        }
+
+        glb_offset += feature_json_length + feature_binary_length + batch_json_length + batch_binary_length;
+
+        if ( byte_length > dview.byteLength || glb_offset >= byte_length ) {
             throw new Error( "Invalid b3dm layout" );
         }
 
-        return b3dm.slice( glb_offset, byte_length );
+        const glb_byte_length = byte_length - glb_offset;
+        if ( glb_offset % 4 === 0 ) {
+            return b3dm.slice( glb_offset, byte_length );
+        }
+
+        const copied = new Uint8Array( glb_byte_length );
+        copied.set( new Uint8Array( b3dm, glb_offset, glb_byte_length ) );
+        return copied.buffer;
     }
 
 
@@ -2046,6 +3432,7 @@ class ThreeDTileset {
         const payload = feature_table_binary.subarray( byte_offset, byte_offset + byte_length );
         const payload_view = new Int8Array( payload.buffer, payload.byteOffset, payload.byteLength );
         let status: any = null;
+        let fatal_decode_error = false;
 
         try {
             buffer.Init( payload_view, payload.byteLength );
@@ -2079,23 +3466,295 @@ class ThreeDTileset {
                 batch_ids: batch_id !== null ? ThreeDTileset._decodeDracoBatchIds( module, decoder, point_cloud, batch_id ) : null,
             };
         }
+        catch ( error ) {
+            fatal_decode_error = error instanceof WebAssembly.RuntimeError;
+            throw error;
+        }
         finally {
-            if ( status ) {
-                module.destroy( status );
-            }
-            module.destroy( point_cloud );
+            void status;
             module.destroy( buffer );
-            module.destroy( decoder );
+            if ( !fatal_decode_error ) {
+                module.destroy( point_cloud );
+                module.destroy( decoder );
+            }
         }
     }
 
 
-    private static async _getDracoDecoderModule(): Promise<any>
+    private static async _getDracoDecoderModule( decoder_kind: "wasm" | "js" = "wasm", script_url?: string | null, wasm_url?: string | null ): Promise<any>
     {
+        if ( decoder_kind === "js" ) {
+            if ( dracoJsDecoderModulePromise === null ) {
+                if ( !script_url ) {
+                    throw new Error( "Draco JS decoder URL is not available" );
+                }
+
+                dracoJsDecoderModulePromise = ThreeDTileset._createDracoJsDecoderModule( script_url, wasm_url );
+            }
+            return await dracoJsDecoderModulePromise;
+        }
+
         if ( dracoDecoderModulePromise === null ) {
-            dracoDecoderModulePromise = WasmTool.createEmObjectByBese64( dracoDecoderWasm, createDracoDecoderModule as any );
+            if ( script_url ) {
+                await ThreeDTileset._loadBrowserScript( script_url );
+            }
+            const global_object = globalThis as any;
+            const module_factory =
+                global_object.createDracoDecoderModule ??
+                global_object.DracoDecoderModule;
+            const wasm_binary_base64 = ThreeDTileset._getGlobalString( "dracoDecoderWasmBase64" );
+            const resolved_wasm_url =
+                wasm_url ??
+                ThreeDTileset._getGlobalString( "dracoDecoderWasmUrl" ) ??
+                ThreeDTileset._getGlobalString( "dracoDecoderWasm" );
+
+            if ( typeof module_factory !== "function" ) {
+                throw new Error( "Draco decoder factory is not available" );
+            }
+
+            if ( wasm_binary_base64 ) {
+                dracoDecoderModulePromise = WasmTool.createEmObjectByBese64( wasm_binary_base64, module_factory as any );
+            }
+            else {
+                dracoDecoderModulePromise = ThreeDTileset._createDracoDecoderModuleFromFactory( module_factory, resolved_wasm_url );
+            }
         }
         return await dracoDecoderModulePromise;
+    }
+
+
+    private static async _createDracoJsDecoderModule( script_url: string, wasm_url?: string | null ): Promise<any>
+    {
+        await ThreeDTileset._loadBrowserScript( script_url );
+        const global_object = globalThis as any;
+        const module_factory = global_object.DracoDecoderModule;
+
+        if ( typeof module_factory !== "function" ) {
+            throw new Error( "Draco JS decoder factory is not available" );
+        }
+
+        const resolved_wasm_url = wasm_url ?? ThreeDTileset._deriveDracoWasmUrl( script_url );
+        const wasm_binary =
+            resolved_wasm_url ?
+                await ThreeDTileset._fetchArrayBuffer( resolved_wasm_url ).catch( () => null ) :
+                null;
+
+        return await ThreeDTileset._createDracoDecoderModuleFromFactory( module_factory, resolved_wasm_url, wasm_binary );
+    }
+
+
+    private static _getGlobalString( name: string ): string | null
+    {
+        const value = (globalThis as any)[name];
+        return typeof value === "string" && value.length > 0 ? value : null;
+    }
+
+
+    private static _resolveBrowserUrl( value: string | null | undefined ): string | null
+    {
+        if ( !value ) {
+            return null;
+        }
+
+        if ( typeof window === "undefined" || typeof window.location?.href !== "string" ) {
+            return value;
+        }
+
+        try {
+            return new URL( value, window.location.href ).toString();
+        }
+        catch {
+            return value;
+        }
+    }
+
+
+    private static _getDefaultBrowserAssetUrl( relative_path: string ): string | null
+    {
+        if ( !THREE_D_TILES_MODULE_BASE_URL ) {
+            return null;
+        }
+
+        try {
+            return new URL( relative_path, THREE_D_TILES_MODULE_BASE_URL ).toString();
+        }
+        catch {
+            return null;
+        }
+    }
+
+
+    private static _deriveDracoJsDecoderUrl( value: string | null | undefined ): string | null
+    {
+        if ( !value ) {
+            return null;
+        }
+
+        return value
+            .replace( /draco_wasm_wrapper\.js(?=[$?]|$)/u, "draco_decoder.js" )
+            .replace( /draco_decoder_nodejs\.js(?=[$?]|$)/u, "draco_decoder.js" );
+    }
+
+
+    private static _deriveDracoWasmUrl( value: string | null | undefined ): string | null
+    {
+        if ( !value ) {
+            return null;
+        }
+
+        return value
+            .replace( /draco_wasm_wrapper\.js(?=[$?]|$)/u, "draco_decoder.wasm" )
+            .replace( /draco_decoder_nodejs\.js(?=[$?]|$)/u, "draco_decoder.wasm" )
+            .replace( /draco_decoder\.js(?=[$?]|$)/u, "draco_decoder.wasm" );
+    }
+
+
+    private static _isFatalDracoRuntimeError( error: unknown ): boolean
+    {
+        return (
+            error instanceof WebAssembly.RuntimeError ||
+            (error instanceof Error && /memory access out of bounds|table index is out of bounds/u.test( error.message ))
+        );
+    }
+
+
+    private static _isBrokenDracoJsFallbackError( error: unknown ): boolean
+    {
+        return (
+            error instanceof TypeError ||
+            (error instanceof Error && /is not a function|Failed to decode Draco mesh payload/u.test( error.message ))
+        );
+    }
+
+
+    private static _shouldResetDracoDecoderModule( error: unknown ): boolean
+    {
+        return (
+            ThreeDTileset._isFatalDracoRuntimeError( error ) ||
+            (error instanceof Error && /Failed to decode Draco mesh payload/u.test( error.message ))
+        );
+    }
+
+
+    private static _resetDracoDecoderModule( decoder_kind: "wasm" | "js" ): void
+    {
+        if ( decoder_kind === "js" ) {
+            dracoJsDecoderModulePromise = null;
+        }
+        else {
+            dracoDecoderModulePromise = null;
+        }
+    }
+
+
+    private static async _runMainThreadDracoDecode<T>( task: () => Promise<T> ): Promise<T>
+    {
+        const previous = dracoMainThreadDecodeTail;
+        let release = () => {};
+        dracoMainThreadDecodeTail = new Promise<void>( resolve => {
+            release = resolve;
+        } );
+
+        await previous;
+
+        try {
+            return await task();
+        }
+        finally {
+            release();
+        }
+    }
+
+
+    private static _loadBrowserScript( script_url: string ): Promise<void>
+    {
+        const existing = dracoScriptLoadPromises.get( script_url );
+        if ( existing ) {
+            return existing;
+        }
+
+        const promise = new Promise<void>( (resolve, reject) => {
+            if ( typeof document === "undefined" ) {
+                reject( new Error( "document is not available for Draco JS decoder loading" ) );
+                return;
+            }
+
+            const script = document.createElement( "script" );
+            script.async = true;
+            script.src = script_url;
+            script.onload = () => resolve();
+            script.onerror = () => reject( new Error( `Failed to load Draco decoder script: ${script_url}` ) );
+            document.head.appendChild( script );
+        } );
+
+        dracoScriptLoadPromises.set( script_url, promise );
+        return promise;
+    }
+
+
+    private static _createDracoDecoderModuleFromFactory( module_factory: (config?: any) => any, wasm_url?: string | null, wasm_binary?: Uint8Array | null ): Promise<any>
+    {
+        return new Promise( (resolve, reject) => {
+            let settled = false;
+            const settle = (module: any) => {
+                if ( settled ) return;
+                settled = true;
+                resolve( module );
+            };
+            const fail = (error: any) => {
+                if ( settled ) return;
+                settled = true;
+                reject( error );
+            };
+
+            const config = {
+                onModuleLoaded: ( module: any ) => settle( module ),
+                locateFile: ( path: string ) => (
+                    wasm_url && path.endsWith( ".wasm" ) ? wasm_url : path
+                ),
+                wasmBinary: wasm_binary ?? undefined,
+            };
+
+            try {
+                const maybe_module = module_factory( config );
+
+                if ( maybe_module && typeof maybe_module.then === "function" ) {
+                    maybe_module.then( settle, fail );
+                    return;
+                }
+
+                if ( maybe_module && maybe_module.ready && typeof maybe_module.ready.then === "function" ) {
+                    maybe_module.ready.then( settle, fail );
+                    return;
+                }
+
+                if ( maybe_module && typeof maybe_module.Decoder === "function" ) {
+                    settle( maybe_module );
+                    return;
+                }
+
+                // Some Draco builds rely only on onModuleLoaded and return a plain config object.
+                setTimeout( () => {
+                    if ( !settled ) {
+                        fail( new Error( "Timed out while initializing Draco decoder module" ) );
+                    }
+                }, 10000 );
+            }
+            catch ( error ) {
+                fail( error );
+            }
+        } );
+    }
+
+
+    private static async _fetchArrayBuffer( resource_url: string ): Promise<Uint8Array>
+    {
+        const response = await fetch( resource_url );
+        if ( !response.ok ) {
+            throw new Error( `Failed to fetch binary resource: ${resource_url}` );
+        }
+
+        return new Uint8Array( await response.arrayBuffer() );
     }
 
 
@@ -2112,6 +3771,47 @@ class ThreeDTileset {
         }
 
         return unique_id;
+    }
+
+
+    private static _createDracoMeshWorkerAttributeSpecs(
+        gltf_json: any,
+        primitive: any,
+        extension_attributes: any
+    ): DracoMeshDecodeWorkerPool.WorkerAttributeSpec[]
+    {
+        if ( typeof extension_attributes !== "object" || extension_attributes === null ) {
+            throw new Error( "Invalid Draco mesh attributes" );
+        }
+
+        const specs: DracoMeshDecodeWorkerPool.WorkerAttributeSpec[] = [];
+        for ( const semantic of Object.keys( extension_attributes ) ) {
+            const accessor_index = primitive?.attributes?.[semantic];
+            if ( !Number.isFinite( Number( accessor_index ) ) || accessor_index < 0 ) {
+                throw new Error( "Missing accessor for Draco mesh attribute: " + semantic );
+            }
+
+            const accessor = gltf_json.accessors[accessor_index];
+            if ( typeof accessor !== "object" || accessor === null ) {
+                throw new Error( "Invalid accessor for Draco mesh attribute: " + semantic );
+            }
+
+            const unique_id = ThreeDTileset._getDracoPropertyUniqueId( extension_attributes, semantic );
+            if ( unique_id === null ) {
+                throw new Error( "Draco attribute unique id was not found: " + semantic );
+            }
+
+            specs.push( {
+                semantic,
+                uniqueId: unique_id,
+                accessorIndex: accessor_index,
+                accessorType: accessor.type,
+                componentType: accessor.componentType,
+                normalized: accessor.normalized === true,
+            } );
+        }
+
+        return specs;
     }
 
 
@@ -3032,6 +4732,7 @@ class ThreeDTileset {
             this._releaseMeshes( meshes );
         }
         this._pnts_worker_pool?.destroy();
+        this._draco_mesh_worker_pool?.destroy();
         this._cache_retained_meshes.clear();
         this._model_primitive_cache.clear();
         this._mesh_ref_counts.clear();
@@ -3121,6 +4822,50 @@ export interface GltfPayload {
 }
 
 
+export interface GltfBufferStorage {
+    buffer_index: number;
+    current_offset: number;
+    use_binary_chunk: boolean;
+    parts: Uint8Array[];
+}
+
+
+export interface DecodedDracoMeshAttribute {
+    accessor_index: number;
+    values: NumericArray;
+    type: string;
+    component_type: number;
+    normalized: boolean;
+    min: number[] | null;
+    max: number[] | null;
+}
+
+
+export interface DecodedDracoMeshIndices {
+    accessor_index: number | null;
+    component_type: number;
+    values: Uint8Array | Uint16Array | Uint32Array;
+}
+
+
+export interface DecodedDracoMeshPrimitive {
+    vertex_count: number;
+    attributes: DecodedDracoMeshAttribute[];
+    indices: DecodedDracoMeshIndices | null;
+}
+
+
+export interface ComponentTypeInfo {
+    bytes: number;
+    draco_data_type: number;
+    typed_array: any;
+    min: number;
+    max: number;
+    is_float: boolean;
+    is_unsigned: boolean;
+}
+
+
 export interface ParsedPnts {
     positions: Float32Array;
     colors: Float32Array;
@@ -3160,6 +4905,10 @@ export interface Option {
     cacheHoldFrames?: number;
     pointSize?: number;
     pointShape?: PointShape;
+    dracoDecoderScriptUrl?: string;
+    dracoDecoderWasmUrl?: string;
+    dracoDecoderWorkerUrl?: string;
+    dracoDecoderJsUrl?: string;
     model_matrix?: Matrix;
     transform?: Resource.TransformCallback;
 }

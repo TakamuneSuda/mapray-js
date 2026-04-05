@@ -6,6 +6,8 @@ import commonjs from '@rollup/plugin-commonjs'
 import strip from '@rollup/plugin-strip';
 import { base64 } from 'rollup-plugin-base64';
 import typescript from 'rollup-plugin-typescript2';
+import fs from 'node:fs';
+import path from 'node:path';
 
 
 const {BUILD, MINIFY} = process.env;
@@ -14,6 +16,12 @@ const minified = MINIFY === 'true';
 const extensions = ['**/*.vert', '**/*.frag', '**/*.glsl', '**/*.svg'];
 const outdir = "dist/";
 const outputFileUMD= umdBuildType(production, minified);
+const dracoVendorDir = path.resolve('vendor');
+const dracoVendorFiles = [
+  'draco_decoder.js',
+  'draco_wasm_wrapper.js',
+  'draco_decoder.wasm',
+];
 
 const strip_option = (
     production ?
@@ -46,6 +54,22 @@ function umdBuildType(isProd, minified) {
 
 console.log("production:" + production);
 console.log("minify:" + minified);
+
+function copyDracoVendorFiles(targetDir) {
+  return {
+    name: `copy-draco-vendor:${targetDir}`,
+    writeBundle() {
+      const destinationDir = path.resolve(targetDir, 'vendor');
+      fs.mkdirSync(destinationDir, { recursive: true });
+      for (const filename of dracoVendorFiles) {
+        fs.copyFileSync(
+          path.join(dracoVendorDir, filename),
+          path.join(destinationDir, filename)
+        );
+      }
+    }
+  };
+}
 
 export default [
   // ES
@@ -83,6 +107,42 @@ export default [
         }
       }),
       strip(strip_option),
+      copyDracoVendorFiles(outdir + 'es/'),
+      minified ? terser() : false
+    ]
+  },
+  // Dedicated Draco worker
+  {
+    input: 'src/workers/ThreeDTilesDracoDecoderWorker.ts',
+    output: {
+      file: outdir + 'es/workers/ThreeDTilesDracoDecoderWorker.js',
+      format: 'iife',
+      indent: false,
+      sourcemap: production ? true : 'inline'
+    },
+    plugins: [
+      resolve(),
+      commonjs(),
+      base64({
+        include: '**/*.wasm'
+      }),
+      string({
+        include: extensions
+      }),
+      typescript({
+        tsconfig: './tsconfig.json',
+        useTsconfigDeclarationDir: false,
+        tsconfigOverride: {
+          compilerOptions: {
+            outDir: outdir + 'es/workers/',
+            declaration: false,
+            declarationMap: false,
+            declarationDir: undefined,
+          }
+        }
+      }),
+      strip(strip_option),
+      copyDracoVendorFiles(outdir + 'es/'),
       minified ? terser() : false
     ]
   },
@@ -122,6 +182,7 @@ export default [
       babel({ // this is for js file in src dir
         exclude: 'node_modules/**'
       }),
+      copyDracoVendorFiles(outdir + 'umd/'),
       minified ? terser() : false
     ]
   }

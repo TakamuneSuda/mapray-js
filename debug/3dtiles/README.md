@@ -43,6 +43,30 @@ yarn --cwd debug/3dtiles start
 
 ブラウザで `http://localhost:7776/` を開きます。
 
+## Smoke Test
+
+headless Chromium で `3dtiles` debug を起動して、`ready / error / console error` を自動確認できます。
+
+初回だけ browser を入れます。
+
+```bash
+yarn --cwd debug/3dtiles smoke:setup
+```
+
+既定では、検証用の `onga_kakoseki` tileset を読みます。
+
+```bash
+yarn --cwd debug/3dtiles smoke
+```
+
+別の tileset を使う場合は `TILESET_URL` を指定します。
+
+```bash
+TILESET_URL=https://example.com/tileset.json yarn --cwd debug/3dtiles smoke
+```
+
+smoke test は `?smoke=1` 付きで debug ページを開き、headless 環境で不安定になりやすい atmosphere / sun visualizer を無効化して、3D Tiles のロード確認に集中します。
+
 ## 使い方
 
 - 上部入力欄に `tileset.json` の URL を入れて `Load`
