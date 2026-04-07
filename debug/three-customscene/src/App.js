@@ -1,163 +1,163 @@
 import mapray from "@mapray/mapray-js";
 import maprayui from "@mapray/ui";
-import * as THREE from "three";
 
+import {
+  INITIAL_ACTOR_POSITION,
+  MODEL_URL,
+  MOVE_SPEED,
+} from "./config";
+import {
+  getMovementDirection,
+  MOVE_KEY_NAMES,
+  translateGeoPoint,
+} from "./movement";
+import ThreeCharacter from "./ThreeCharacter";
 
 export default class App extends maprayui.StandardUIViewer {
+  constructor(container, options = {}) {
+    super(container, process.env.MAPRAY_ACCESS_TOKEN, {
+      debug_stats: new mapray.DebugStats(),
+    });
 
-    constructor( container, options = {} )
-    {
-        super( container, process.env.MAPRAY_ACCESS_TOKEN, {
-            debug_stats: new mapray.DebugStats(),
-        } );
+    this._status = options.status || undefined;
+    this._pressed_keys = new Set();
+    this._actor_position = { ...INITIAL_ACTOR_POSITION };
+    this._on_key_down = (event) => this._updateMoveKey(event, true);
+    this._on_key_up = (event) => this._updateMoveKey(event, false);
+    this._on_pointer_down = () => this.viewer.canvas_element.focus();
 
-        this._status = options.status || undefined;
-        this._three_renderer = undefined;
-        this._view_to_clip = mapray.GeoMath.createMatrix();
+    this._setInitialCamera();
 
-        this.setCameraPosition( {
-            longitude: 139.7671,
-            latitude: 35.6812 - 0.03,
-            height: 1800,
-        } );
-        this.setLookAtPosition( {
-            longitude: 139.7671,
-            latitude: 35.6812,
-            height: 250,
-        } );
+    this._three_scene = new mapray.ThreeCustomScene(this.viewer, {
+      anchor_geo_point: this._actor_position,
+      dispose: () => this._disposeResources(),
+    });
+    this._custom_scene = this._three_scene.custom_scene;
+    this._character = new ThreeCharacter(
+      this.viewer,
+      this._three_scene,
+      this._actor_position,
+      MODEL_URL,
+    );
 
-        this._three_scene = new THREE.Scene();
-        this._three_camera = new THREE.Camera();
-        this._three_camera.matrixAutoUpdate = false;
-        this._three_camera.matrixWorldAutoUpdate = false;
+    this._attachInputHandlers();
+    this._update_status();
+  }
 
-        this._anchor_group = new THREE.Group();
-        this._anchor_group.matrixAutoUpdate = false;
+  onUpdateFrame(delta_time) {
+    super.onUpdateFrame(delta_time);
 
-        const anchor_geo_point = new mapray.GeoPoint( 139.7671, 35.6812, 180 );
-        const anchor_matrix = mapray.GeoMath.createMatrix();
-        anchor_geo_point.getMlocsToGocsMatrix( anchor_matrix );
-        this._anchor_group.matrix.fromArray( Array.from( anchor_matrix ) );
+    const movement = getMovementDirection(
+      this.getCameraAngle().yaw,
+      this._pressed_keys,
+    );
+    const is_running = movement.lengthSq() > 0;
 
-        const cube_geometry = new THREE.BoxGeometry( 120, 120, 120 );
-        const cube_material = new THREE.MeshNormalMaterial();
-        this._cube = new THREE.Mesh( cube_geometry, cube_material );
-        this._cube.position.set( 0, 0, 120 );
-        this._cube.frustumCulled = false;
+    if (is_running) {
+      movement.normalize();
 
-        this._axes = new THREE.AxesHelper( 220 );
-        this._axes.frustumCulled = false;
+      const distance = MOVE_SPEED * delta_time;
+      const east_meters = -movement.x * distance;
+      const north_meters = movement.y * distance;
 
-        this._anchor_group.add( this._cube );
-        this._anchor_group.add( this._axes );
-        this._three_scene.add( this._anchor_group );
-
-        this._custom_scene = this.viewer.custom_scene_collection.createScene( {
-            draw: stage => this._draw_three_scene( stage ),
-            destroy: () => this._dispose_three_scene(),
-        } );
-
-        this._update_status();
+      this._character.translate(east_meters, north_meters);
+      this._moveCamera(east_meters, north_meters);
+      this._character.setHeading(Math.atan2(movement.x, movement.y));
     }
 
+    this._character.step(delta_time, is_running);
+    this._update_status();
+  }
 
-    onUpdateFrame( delta_time )
-    {
-        super.onUpdateFrame( delta_time );
+  _setInitialCamera() {
+    this.setCameraPosition({
+      longitude: INITIAL_ACTOR_POSITION.longitude,
+      latitude: INITIAL_ACTOR_POSITION.latitude - 0.03,
+      height: 1800,
+    });
+    this.setLookAtPosition({
+      longitude: INITIAL_ACTOR_POSITION.longitude,
+      latitude: INITIAL_ACTOR_POSITION.latitude,
+      height: 50,
+    });
+  }
 
-        const rotate_step = delta_time * 0.001;
-        this._cube.rotation.x += rotate_step * 0.6;
-        this._cube.rotation.y += rotate_step * 1.0;
-        this._cube.rotation.z += rotate_step * 0.3;
+  _attachInputHandlers() {
+    document.addEventListener("keydown", this._on_key_down, {
+      capture: true,
+      passive: false,
+    });
+    document.addEventListener("keyup", this._on_key_up, {
+      capture: true,
+      passive: false,
+    });
+    this.viewer.canvas_element.addEventListener(
+      "pointerdown",
+      this._on_pointer_down,
+    );
+    this.viewer.canvas_element.focus();
+  }
 
-        this._update_status();
+  _moveCamera(east_meters, north_meters) {
+    const camera_position = this.getCameraPosition();
+    translateGeoPoint(camera_position, east_meters, north_meters);
+    this.setCameraPosition(camera_position);
+  }
+
+  _updateMoveKey(event, pressed) {
+    if (!MOVE_KEY_NAMES.has(event.key)) {
+      return;
     }
 
-
-    _draw_three_scene( stage )
-    {
-        if ( stage.getRenderTarget() !== "SCENE" ) {
-            return;
-        }
-
-        const renderer = this._ensure_three_renderer();
-
-        mapray.GeoMath.mul_GA( stage.gocs_to_clip, stage.view_to_gocs, this._view_to_clip );
-
-        this._three_camera.matrixWorld.fromArray( Array.from( stage.view_to_gocs ) );
-        this._three_camera.matrixWorldInverse.fromArray( Array.from( stage.gocs_to_view ) );
-        this._three_camera.projectionMatrix.fromArray( Array.from( this._view_to_clip ) );
-        this._three_camera.projectionMatrixInverse.copy( this._three_camera.projectionMatrix ).invert();
-        this._three_camera.updateMatrixWorld( true );
-
-        renderer.resetState();
-        renderer.autoClear = false;
-        renderer.setViewport( 0, 0, stage.width, stage.height );
-        renderer.render( this._three_scene, this._three_camera );
-        renderer.resetState();
+    if (pressed) {
+      this._pressed_keys.add(event.key);
+    } else {
+      this._pressed_keys.delete(event.key);
     }
 
+    event.preventDefault();
+    event.stopPropagation();
+  }
 
-    _ensure_three_renderer()
-    {
-        if ( this._three_renderer ) {
-            return this._three_renderer;
-        }
+  _disposeResources() {
+    document.removeEventListener("keydown", this._on_key_down, {
+      capture: true,
+    });
+    document.removeEventListener("keyup", this._on_key_up, { capture: true });
+    this.viewer.canvas_element.removeEventListener(
+      "pointerdown",
+      this._on_pointer_down,
+    );
 
-        const canvas = this.viewer.canvas_element;
-        const context = canvas.getContext( "webgl2" );
-        if ( !context ) {
-            throw new Error( "webgl2 context is unavailable" );
-        }
+    this._character?.dispose();
+  }
 
-        this._three_renderer = new THREE.WebGLRenderer( {
-            canvas,
-            context,
-            alpha: true,
-            antialias: true,
-        } );
-        this._three_renderer.autoClear = false;
-        this._three_renderer.sortObjects = false;
-
-        return this._three_renderer;
+  _update_status() {
+    if (!this._status) {
+      return;
     }
 
+    const character = this._character?.getStatus();
+    const camera_position = this.getCameraPosition();
+    const camera_angle = this.getCameraAngle();
 
-    _dispose_three_scene()
-    {
-        this._cube.geometry.dispose();
-        this._cube.material.dispose();
-        this._axes.geometry.dispose();
-
-        const axes_material = this._axes.material;
-        if ( Array.isArray( axes_material ) ) {
-            axes_material.forEach( material => material.dispose() );
-        }
-        else {
-            axes_material.dispose();
-        }
-
-        this._three_renderer?.dispose();
-        this._three_renderer = undefined;
-    }
-
-
-    _update_status()
-    {
-        if ( !this._status ) {
-            return;
-        }
-
-        const camera_position = this.getCameraPosition();
-        const camera_angle = this.getCameraAngle();
-
-        this._status.textContent =
-            "CustomScene: enabled\n" +
-            "Renderer: three.js on shared WebGL2 context\n" +
-            "Object: spinning cube above Tokyo Station\n\n" +
-            `Camera: ${camera_position.longitude.toFixed(5)}, ${camera_position.latitude.toFixed(5)}, ${camera_position.height.toFixed(1)}m\n` +
-            `Angle: pitch ${camera_angle.pitch.toFixed(1)} / yaw ${camera_angle.yaw.toFixed(1)} / roll ${camera_angle.roll.toFixed(1)}\n` +
-            `Scene count: ${this.viewer.custom_scene_collection.num_scenes}\n` +
-            `Visible: ${this._custom_scene.visibility}`;
-    }
+    this._status.textContent =
+      "CustomScene: enabled\n" +
+      "Renderer: three.js on shared WebGL2 context via mapray.ThreeCustomScene\n" +
+      `Model: ${character?.model_url || MODEL_URL}\n` +
+      `Load: ${character?.load_state || "loading"}\n` +
+      (character?.load_error ? `Error: ${character.load_error}\n` : "") +
+      `Clips: ${character?.available_clips.join(", ") || "(none)"}\n` +
+      `Action: ${character?.active_action_name || "(none)"}\n` +
+      `Weights: idle ${character?.idle_weight || "-"} / run ${character?.run_weight || "-"}\n` +
+      `Times: idle ${character?.idle_time || "-"} / run ${character?.run_time || "-"}\n` +
+      `Mixer timeScale: ${character?.mixer_time_scale || "-"}\n` +
+      `Actor: ${this._actor_position.longitude.toFixed(5)}, ${this._actor_position.latitude.toFixed(5)}, ${(character?.ground_height ?? 0).toFixed(1)}m\n` +
+      `Keys: ${Array.from(this._pressed_keys).join(", ") || "(none)"}\n` +
+      "Move: Arrow keys (run)\n\n" +
+      `Camera: ${camera_position.longitude.toFixed(5)}, ${camera_position.latitude.toFixed(5)}, ${camera_position.height.toFixed(1)}m\n` +
+      `Angle: pitch ${camera_angle.pitch.toFixed(1)} / yaw ${camera_angle.yaw.toFixed(1)} / roll ${camera_angle.roll.toFixed(1)}\n` +
+      `Scene count: ${this.viewer.custom_scene_collection.num_scenes}\n` +
+      `Visible: ${this._custom_scene.visibility}`;
+  }
 }

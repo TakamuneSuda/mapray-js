@@ -37,5 +37,6 @@ Open [http://localhost:7776/](http://localhost:7776/).
 Notes
 --------------------------------------------------------------------------------
 - The sample shares the existing `webgl2` canvas with mapray.
+- This sample still shows the low-level `CustomScene` integration directly.
 - Babylon.js rendering runs only for the normal scene pass, so mapray picking is not disturbed.
 - The box is placed above Tokyo Station using GOCS/Mapray local coordinates.

@@ -4,8 +4,8 @@ Three.js CustomScene Sample
 
 Setup
 --------------------------------------------------------------------------------
-This sample uses `mapray` for the globe and `three.js` for a custom-rendered cube
-drawn through `Viewer.custom_scene_collection`.
+This sample uses `mapray` for the globe and `three.js` for an animated glTF
+character drawn through `mapray.ThreeCustomScene`.
 
 `MAPRAY_ACCESS_TOKEN` must be defined.
 
@@ -37,5 +37,8 @@ Open [http://localhost:7776/](http://localhost:7776/).
 Notes
 --------------------------------------------------------------------------------
 - The sample shares the existing `webgl2` canvas/context with mapray.
-- three.js rendering runs only for the normal scene pass, so mapray picking is not disturbed.
-- The cube is placed above Tokyo Station using GOCS/Mapray local coordinates.
+- `mapray.ThreeCustomScene` handles the normal scene pass only, so mapray picking is not disturbed.
+- Arrow keys move the character over the Tokyo Station area.
+- The character height follows `Viewer.getElevation()` so it stays on the terrain.
+- By default the model is loaded from `https://threejs.org/examples/models/gltf/Soldier.glb`.
+- You can override the model with `?model=<url>`.

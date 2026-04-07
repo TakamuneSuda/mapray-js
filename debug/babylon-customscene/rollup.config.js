@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import terser from '@rollup/plugin-terser';
 import postcss from 'rollup-plugin-postcss';
 import pluginNodeResolve from '@rollup/plugin-node-resolve';
@@ -7,8 +10,36 @@ import sourcemaps from 'rollup-plugin-sourcemaps';
 
 const outdir = "dist/";
 
+function loadDotEnv( filePath ) {
+    if ( !fs.existsSync( filePath ) ) {
+        return {};
+    }
+
+    const source = fs.readFileSync( filePath, "utf8" );
+    const result = {};
+
+    for ( const rawLine of source.split( /\r?\n/ ) ) {
+        const line = rawLine.trim();
+        if ( !line || line.startsWith( "#" ) ) {
+            continue;
+        }
+
+        const separator = line.indexOf( "=" );
+        if ( separator < 0 ) {
+            continue;
+        }
+
+        const key = line.slice( 0, separator ).trim();
+        const value = line.slice( separator + 1 ).trim().replace( /^['"]|['"]$/g, "" );
+        result[key] = value;
+    }
+
+    return result;
+}
+
+const dotenv = loadDotEnv( path.resolve( ".env" ) );
 const env = {
-    MAPRAY_ACCESS_TOKEN: process.env.MAPRAY_ACCESS_TOKEN,
+    MAPRAY_ACCESS_TOKEN: process.env.MAPRAY_ACCESS_TOKEN ?? dotenv.MAPRAY_ACCESS_TOKEN,
 };
 
 const { BUILD } = process.env;
