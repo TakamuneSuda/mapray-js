@@ -1,0 +1,39 @@
+#ui {
+  position: fixed;
+  inset: 0;
+}
+
+#ui > canvas:focus {
+  outline-width: 0;
+}
+
+#tools {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  max-width: 360px;
+  font-family: monospace;
+  background: rgba(0, 0, 0, 0.78);
+  color: #fff;
+  padding: 12px;
+  border-radius: 8px;
+  line-height: 1.5;
+}
+
+#status {
+  margin-bottom: 10px;
+  white-space: pre-wrap;
+}
+
+#tools details + details {
+  margin-top: 10px;
+}
+
+#tools summary {
+  cursor: pointer;
+}
+
+#tools p,
+#tools pre {
+  margin: 6px 0 0;
+}
