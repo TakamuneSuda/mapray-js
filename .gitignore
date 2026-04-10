@@ -16,6 +16,7 @@ browser-test/results/
 .idea
 .vscode
 .DS_Store
+.env
 
 ## pyenv
 .python-version
