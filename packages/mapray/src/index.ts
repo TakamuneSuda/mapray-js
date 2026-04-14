@@ -70,6 +70,10 @@ export { default as B3dCollection } from "./B3dCollection";
 export { default as B3dScene } from "./B3dScene";
 export { default as CustomSceneCollection } from "./CustomSceneCollection";
 export { default as CustomScene } from "./CustomScene";
+export { default as ExternalRendererScene } from "./ExternalRendererScene";
+export type { ExternalRendererInit, ExternalRenderFrame, ExternalRendererAdapter, ExternalRendererSceneOption } from "./ExternalRendererScene";
+export { default as ThreeCustomScene } from "./ThreeCustomScene";
+export type { ThreeCustomSceneOption } from "./ThreeCustomScene";
 
 // PointCloud
 export { default as PointCloud } from "./PointCloud";

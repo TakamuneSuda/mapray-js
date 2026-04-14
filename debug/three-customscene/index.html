@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+
+
+<html>
+
+<head>
+<meta charset="UTF-8"/>
+<link rel="stylesheet" type="text/css" href="app.css"/>
+<script type="text/javascript" src="dist/bundle.js"></script>
+<script type="text/javascript">
+window.addEventListener("load", () => {
+  const node = document.getElementById("ui");
+  const status = document.getElementById("status");
+  new App(node, { status });
+});
+</script>
+</head>
+
+<body>
+<div id="ui"></div>
+<div id="tools">
+    <div id="status"></div>
+    <details open>
+      <summary>About</summary>
+      <p>This sample renders an animated glTF character through mapray.ThreeCustomScene and keeps it on top of terrain elevations.</p>
+    </details>
+    <details>
+      <summary>Controls</summary>
+      <pre>
+Mouse drag: rotate camera
+Mouse wheel: zoom
+Right drag: move camera
+Arrow keys: move character
+      </pre>
+    </details>
+</div>
+</body>
+</html>
