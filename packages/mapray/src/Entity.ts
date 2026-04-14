@@ -11,6 +11,8 @@ import Primitive from "./Primitive";
 import EntityRegion from "./EntityRegion";
 import EntityMaterial from "./EntityMaterial";
 import { Area } from "./AreaUtil";
+import type Ray from "./Ray";
+import type { Vector3 } from "./GeoMath";
 
 
 /**
@@ -384,6 +386,29 @@ export abstract class PrimitiveProducer {
      * @return         プリミティブ配列
      */
     abstract getPrimitives( stage: RenderStage ): Primitive[];
+
+
+    /**
+     * レイとの交点情報を取得
+     *
+     * `Viewer.pickWithRay()` から利用される任意実装のフック。
+     * 既定の実装では交差なしとして `undefined` を返す。
+     *
+     * @param ray    レイ (GOCS)
+     * @param limit  制限距離
+     *
+     * @return 交点情報または undefined
+     */
+    getRayIntersection( ray: Ray, limit: number ): Entity.RayIntersectionResult | undefined
+    {
+        return undefined;
+    }
+}
+
+
+export interface RayIntersectionResult {
+    distance: number;
+    position: Vector3;
 }
 
 

@@ -9,6 +9,7 @@ import GeoRegion from "./GeoRegion";
 import Orientation from "./Orientation";
 import AltitudeMode from "./AltitudeMode";
 import EntityRegion from "./EntityRegion";
+import Ray from "./Ray";
 import Type from "./animation/Type";
 import AnimUtil from "./animation/AnimUtil";
 import Curve from "./animation/Curve";
@@ -490,6 +491,52 @@ export class PrimitiveProducer extends Entity.PrimitiveProducer {
     }
 
 
+    override getRayIntersection( ray: Ray, limit: number ): Entity.RayIntersectionResult | undefined
+    {
+        const entity_to_gocs = this.getMatrix( GeoMath.createMatrix() );
+        const primitives = this._primitives;
+        const ptoe_array = this._ptoe_array;
+
+        let nearest_distance = limit;
+        let nearest_position: Vector3 | undefined;
+
+        for ( let i = 0; i < primitives.length; ++i ) {
+            const prim = primitives[i];
+            const bbox = prim.bbox;
+
+            if ( !bbox ) {
+                continue;
+            }
+
+            const ptoe = ptoe_array[i];
+            const primitive_to_gocs = GeoMath.mul_AA( entity_to_gocs, ptoe, temp_primitive_to_gocs );
+            const gocs_to_primitive = GeoMath.inverse_A( primitive_to_gocs, temp_gocs_to_primitive );
+            const primitive_ray = Ray.transform_A( gocs_to_primitive, ray, temp_primitive_ray );
+            const primitive_distance = findBoxRayDistance( bbox, primitive_ray, Number.MAX_VALUE );
+
+            if ( primitive_distance === undefined ) {
+                continue;
+            }
+
+            temp_primitive_point[0] = primitive_ray.position[0] + primitive_distance * primitive_ray.direction[0];
+            temp_primitive_point[1] = primitive_ray.position[1] + primitive_distance * primitive_ray.direction[1];
+            temp_primitive_point[2] = primitive_ray.position[2] + primitive_distance * primitive_ray.direction[2];
+
+            const gocs_position = GeoMath.transformPosition_A( primitive_to_gocs, temp_primitive_point, temp_gocs_point );
+            const gocs_distance = getRayDistanceAtPoint( ray, gocs_position );
+
+            if ( gocs_distance < 0 || gocs_distance >= nearest_distance ) {
+                continue;
+            }
+
+            nearest_distance = gocs_distance;
+            nearest_position = GeoMath.createVector3( gocs_position );
+        }
+
+        return nearest_position ? { distance: nearest_distance, position: nearest_position } : undefined;
+    }
+
+
     /**
      * bboxを利用して簡易的にバウンディングを算出
      *
@@ -750,3 +797,66 @@ function mul_RS( rmat: Matrix, svec: Vector3, dst: Matrix )
 
 
 export default ModelEntity;
+
+
+function findBoxRayDistance( bbox: Vector3[], ray: Ray, limit: number ): number | undefined
+{
+    let tmin = 0;
+    let tmax = limit;
+
+    for ( let axis = 0; axis < 3; ++axis ) {
+        const origin = ray.position[axis];
+        const direction = ray.direction[axis];
+        const min = bbox[0][axis];
+        const max = bbox[1][axis];
+
+        if ( Math.abs( direction ) < 1.0e-12 ) {
+            if ( origin < min || origin > max ) {
+                return undefined;
+            }
+            continue;
+        }
+
+        let t0 = (min - origin) / direction;
+        let t1 = (max - origin) / direction;
+
+        if ( t1 < t0 ) {
+            const tmp = t0;
+            t0 = t1;
+            t1 = tmp;
+        }
+
+        tmin = Math.max( tmin, t0 );
+        tmax = Math.min( tmax, t1 );
+
+        if ( tmax < tmin ) {
+            return undefined;
+        }
+    }
+
+    return tmin;
+}
+
+
+function getRayDistanceAtPoint( ray: Ray, point: Vector3 ): number
+{
+    const delta = temp_ray_delta;
+    delta[0] = point[0] - ray.position[0];
+    delta[1] = point[1] - ray.position[1];
+    delta[2] = point[2] - ray.position[2];
+
+    const direction_length_sq = GeoMath.dot3( ray.direction, ray.direction );
+    if ( direction_length_sq <= 0 ) {
+        return Number.MAX_VALUE;
+    }
+
+    return GeoMath.dot3( delta, ray.direction ) / direction_length_sq;
+}
+
+
+const temp_primitive_to_gocs = GeoMath.createMatrix();
+const temp_gocs_to_primitive = GeoMath.createMatrix();
+const temp_primitive_ray = new Ray( GeoMath.createVector3(), GeoMath.createVector3() );
+const temp_primitive_point = GeoMath.createVector3();
+const temp_gocs_point = GeoMath.createVector3();
+const temp_ray_delta = GeoMath.createVector3();

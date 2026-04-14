@@ -892,12 +892,18 @@ class Viewer {
     pickWithRay( ray: Ray, opts: Viewer.PickOption = {} ):  Viewer.PickResult | undefined
     {
         const limit      = (opts.limit      !== undefined) ? opts.limit      : Number.MAX_VALUE;
+        const isExcluded = ( category: Viewer.Category ) =>
+            (opts.exclude_category?.indexOf( category ) ?? -1) !== -1;
 
         let category;
         let distance = limit;
         let b3d_info;
+        let entity;
+        let entity_position;
+        let point_cloud;
+        let point_cloud_position;
 
-        if ( (opts.exclude_category?.indexOf( Viewer.Category.B3D_SCENE ) ?? -1) === -1 ) {
+        if ( !isExcluded( Viewer.Category.B3D_SCENE ) ) {
             // B3D
             b3d_info = this._b3d_collection.getRayIntersection( ray, distance );
 
@@ -908,11 +914,56 @@ class Viewer {
             }
         }
 
+        if ( !isExcluded( Viewer.Category.ENTITY ) ) {
+            for ( let i = 0; i < this._scene.num_entities; ++i ) {
+                const scene_entity = this._scene.getEntity( i );
+
+                if ( !scene_entity.visibility || !scene_entity.isPickable() ) {
+                    continue;
+                }
+
+                const producer = scene_entity.getPrimitiveProducer();
+                if ( !producer ) {
+                    continue;
+                }
+
+                const entity_info = producer.getRayIntersection( ray, distance );
+                if ( !entity_info || entity_info.distance >= distance ) {
+                    continue;
+                }
+
+                category = Viewer.Category.ENTITY;
+                distance = entity_info.distance;
+                entity = scene_entity;
+                entity_position = entity_info.position;
+            }
+        }
+
+        if ( !isExcluded( Viewer.Category.POINT_CLOUD ) ) {
+            for ( let i = 0; i < this._point_cloud_collection.length; ++i ) {
+                const scene_point_cloud = this._point_cloud_collection.get( i );
+
+                if ( !scene_point_cloud.getVisibility() ) {
+                    continue;
+                }
+
+                const point_cloud_info = findPointCloudRayIntersection( scene_point_cloud, ray, distance );
+                if ( !point_cloud_info || point_cloud_info.distance >= distance ) {
+                    continue;
+                }
+
+                category = Viewer.Category.POINT_CLOUD;
+                distance = point_cloud_info.distance;
+                point_cloud = scene_point_cloud;
+                point_cloud_position = point_cloud_info.position;
+            }
+        }
+
 
         // 地表
         // ignore this._ground_visibility at this version.
         // if ( this._ground_visibility && (this._globe.status === Globe.Status.READY) ) {
-        if ( (opts.exclude_category?.indexOf( Viewer.Category.GROUND ) ?? -1) === -1 ) {
+        if ( !isExcluded( Viewer.Category.GROUND ) ) {
             if ( this._globe.status === Globe.Status.READY ) {
                 const globe_dist = this._globe.findRayDistance( ray, distance );
                 if ( globe_dist !== distance  ) {
@@ -931,12 +982,14 @@ class Viewer {
         }
 
         // 位置 P = Q + distance V
-        const p = GeoMath.createVector3();
-        const q = ray.position;
-        const v = ray.direction;
+        const p = entity_position ?? point_cloud_position ?? GeoMath.createVector3();
+        if ( !entity_position && !point_cloud_position ) {
+            const q = ray.position;
+            const v = ray.direction;
 
-        for ( let i = 0; i < 3; ++i ) {
-            p[i] = q[i] + distance * v[i];
+            for ( let i = 0; i < 3; ++i ) {
+                p[i] = q[i] + distance * v[i];
+            }
         }
 
         // 結果を返す
@@ -945,6 +998,13 @@ class Viewer {
             distance,
             position: p
         };
+
+        if ( category === Viewer.Category.ENTITY ) {
+            ex_info.entity = entity;
+        }
+        else if ( category === Viewer.Category.POINT_CLOUD ) {
+            ex_info.point_cloud = point_cloud;
+        }
 
         // B3D 専用の情報を追加
         if ( category === Viewer.Category.B3D_SCENE ) {
@@ -1311,6 +1371,75 @@ class Viewer {
     {
         this._scene.animation.unbindAllRecursively();
     }
+}
+
+
+function findPointCloudRayIntersection( point_cloud: PointCloud, ray: Ray, limit: number ): { distance: number; position: Vector3 } | undefined
+{
+    let nearest_distance = limit;
+    let nearest_position: Vector3 | undefined;
+
+    point_cloud.root.forEach( box => {
+        if ( !box.is_loaded ) {
+            return;
+        }
+
+        const box_distance = findAabbRayDistance( box.gocs_min, box.gocs_max, ray, nearest_distance );
+        if ( box_distance === undefined ) {
+            return;
+        }
+
+        nearest_distance = box_distance;
+        nearest_position = GeoMath.createVector3( [
+            ray.position[0] + box_distance * ray.direction[0],
+            ray.position[1] + box_distance * ray.direction[1],
+            ray.position[2] + box_distance * ray.direction[2],
+        ] );
+    } );
+
+    return nearest_position ? { distance: nearest_distance, position: nearest_position } : undefined;
+}
+
+
+function findAabbRayDistance( min: Vector3, max: Vector3, ray: Ray, limit: number ): number | undefined
+{
+    const epsilon = 1.0e-6;
+    let tmin = 0;
+    let tmax = limit;
+
+    for ( let axis = 0; axis < 3; ++axis ) {
+        const origin = ray.position[axis];
+        const direction = ray.direction[axis];
+
+        if ( Math.abs( direction ) < 1.0e-12 ) {
+            if ( origin < min[axis] || origin > max[axis] ) {
+                return undefined;
+            }
+            continue;
+        }
+
+        let t0 = (min[axis] - origin) / direction;
+        let t1 = (max[axis] - origin) / direction;
+
+        if ( t1 < t0 ) {
+            const tmp = t0;
+            t0 = t1;
+            t1 = tmp;
+        }
+
+        tmin = Math.max( tmin, t0 );
+        tmax = Math.min( tmax, t1 );
+
+        if ( tmax < tmin ) {
+            return undefined;
+        }
+    }
+
+    if ( tmin > epsilon ) {
+        return tmin;
+    }
+
+    return tmax > epsilon ? tmax : undefined;
 }
 
 
