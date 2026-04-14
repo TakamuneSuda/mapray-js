@@ -290,7 +290,7 @@ class PickTool {
         gl.readPixels( 0, 0, this._width, this._height, gl.RED, gl.FLOAT, this._depth_value );
         endDepthRead = Date.now();
 
-        depth_clip = this._depth_value[0];
+        depth_clip = this._depth_value[ Math.floor( this._width * this._height / 2 ) ];
 
         this._depth_to_color_frame_buffer.unbind();
 

@@ -4,6 +4,11 @@ import GeoMath = mapray.GeoMath;
 import GeoPoint = mapray.GeoPoint;
 
 
+const INTERACTION_PICK_OPTION: mapray.Viewer.PickOption = {
+    exclude_category: [mapray.Viewer.Category.POINT_CLOUD],
+};
+
+
 
 /**
  * 標準 Mapray Viewer
@@ -59,6 +64,12 @@ class StandardUIViewer extends mapray.RenderCallback
 
     /** 回転中心 */
     private _rotate_center?: mapray.Vector3;
+
+    /** 直近で有効だった地図操作の基準点 */
+    private _last_valid_interaction_position?: mapray.Vector3;
+
+    /** 直近で有効だった地図操作の基準点の高度 */
+    private _last_valid_interaction_altitude?: number;
 
     /** 平行移動の移動量（マウスの移動量） */
     private _translate_drag: mapray.Vector2;
@@ -150,6 +161,8 @@ class StandardUIViewer extends mapray.RenderCallback
         this._mouse_down_position = [0, 0];
         this._pre_mouse_position  = [0, 0];
         this._rotate_center = GeoMath.createVector3();
+        this._last_valid_interaction_position = undefined;
+        this._last_valid_interaction_altitude = undefined;
 
         this._translate_drag        = GeoMath.createVector2f();
         this._translate_eye_drag    = GeoMath.createVector2f();
@@ -783,7 +796,7 @@ class StandardUIViewer extends mapray.RenderCallback
         if ( event.button === 0 ) {
             if ( event.shiftKey ) {
                 this._operation_mode = StandardUIViewer.OperationMode.ROTATE;
-                this._rotate_center = this._pickInteractionPosition( this._mouse_down_position );
+                this._rotate_center = this._pickRotationCenter( this._mouse_down_position );
             }
             else if ( event.ctrlKey ) {
                 this._operation_mode = StandardUIViewer.OperationMode.FREE_ROTATE;
@@ -795,7 +808,7 @@ class StandardUIViewer extends mapray.RenderCallback
         // 中ボタン
         else if ( event.button === 1 ) {
             this._operation_mode = StandardUIViewer.OperationMode.ROTATE;
-            this._rotate_center = this._pickInteractionPosition( this._mouse_down_position );
+            this._rotate_center = this._pickRotationCenter( this._mouse_down_position );
         }
         // 右ボタン
         else if ( event.button === 2 ) {
@@ -1108,7 +1121,7 @@ class StandardUIViewer extends mapray.RenderCallback
             }
 
             const camera = viewer.camera;
-            const start_position = this._pickInteractionPosition( this._mouse_down_position );
+            const start_position = this._pickInteractionPosition( this._mouse_down_position, undefined, true );
 
             const end_mouse_position = GeoMath.createVector2([
                     this._mouse_down_position[0] + this._translate_drag[0],
@@ -1122,7 +1135,7 @@ class StandardUIViewer extends mapray.RenderCallback
             const start_spherical_position = new mapray.GeoPoint();
             start_spherical_position.setFromGocs( start_position );
 
-            const end_position = this._pickInteractionPosition( end_mouse_position, start_spherical_position.altitude );
+            const end_position = this._pickInteractionPosition( end_mouse_position, start_spherical_position.altitude, true );
             if ( !end_position ) {
                 return;
             }
@@ -1308,7 +1321,7 @@ class StandardUIViewer extends mapray.RenderCallback
 
         // 移動中心
         let translation_center: mapray.Vector3;
-        const pickPosition = this._pickInteractionPosition( this._mouse_down_position );
+        const pickPosition = this._pickInteractionPosition( this._mouse_down_position, undefined, true );
         if ( pickPosition ) {
             translation_center = pickPosition;
         }
@@ -1511,21 +1524,44 @@ class StandardUIViewer extends mapray.RenderCallback
     }
 
     /**
-     * 画面上の位置に対応する地表交点を取得する。
+     * 画面上の位置に対応する操作基準点を取得する。
      */
-    private _pickInteractionPosition( screen_position: mapray.Vector2 | [x: number, y: number], altitude_hint?: number ): mapray.Vector3 | undefined
+    private _pickInteractionPosition(
+        screen_position: mapray.Vector2 | [x: number, y: number],
+        altitude_hint?: number,
+        allow_last_valid_position: boolean = false
+    ): mapray.Vector3 | undefined
     {
         const picked_position = this._pickDirectInteractionPosition( screen_position );
         if ( picked_position ) {
+            this._rememberInteractionPosition( picked_position );
             return picked_position;
         }
 
-        if ( !this.viewer.isCameraUnderground() ) {
-            return undefined;
+        const ray_picked_position = this._pickRayInteractionPosition( screen_position );
+        if ( ray_picked_position ) {
+            this._rememberInteractionPosition( ray_picked_position );
+            return ray_picked_position;
         }
 
-        const altitude = altitude_hint ?? this._getFallbackGroundElevation();
-        return this._intersectCanvasRayWithSphere( screen_position, altitude );
+        const altitude = this._getFallbackInteractionAltitude( altitude_hint );
+        const plane_picked_position = this._intersectCanvasRayWithGroundPlane( screen_position, altitude );
+        if ( plane_picked_position ) {
+            this._rememberInteractionPosition( plane_picked_position );
+            return plane_picked_position;
+        }
+
+        const sphere_picked_position = this._intersectCanvasRayWithSphere( screen_position, altitude );
+        if ( sphere_picked_position ) {
+            this._rememberInteractionPosition( sphere_picked_position );
+            return sphere_picked_position;
+        }
+
+        if ( allow_last_valid_position && this._last_valid_interaction_position ) {
+            return GeoMath.createVector3( this._last_valid_interaction_position );
+        }
+
+        return undefined;
     }
 
     /**
@@ -1533,8 +1569,61 @@ class StandardUIViewer extends mapray.RenderCallback
      */
     private _pickDirectInteractionPosition( screen_position: mapray.Vector2 | [x: number, y: number] ): mapray.Vector3 | undefined
     {
-        const pickResult = this.viewer.pick( screen_position );
+        const pickResult = this.viewer.pick( screen_position, INTERACTION_PICK_OPTION );
         return pickResult ? GeoMath.createVector3( pickResult.position ) : undefined;
+    }
+
+    /**
+     * 画面位置に対応するレイの交点を取得する。
+     */
+    private _pickRayInteractionPosition( screen_position: mapray.Vector2 | [x: number, y: number] ): mapray.Vector3 | undefined
+    {
+        const ray = this.viewer.camera.getCanvasRay( screen_position );
+        const pickResult = this.viewer.pickWithRay( ray, INTERACTION_PICK_OPTION );
+        return pickResult ? GeoMath.createVector3( pickResult.position ) : undefined;
+    }
+
+    /**
+     * 有効な地図操作基準点を記録する。
+     */
+    private _rememberInteractionPosition( position: mapray.Vector3 ): void
+    {
+        this._last_valid_interaction_position = GeoMath.createVector3( position );
+
+        const geo_point = new mapray.GeoPoint();
+        geo_point.setFromGocs( position );
+        this._last_valid_interaction_altitude = geo_point.altitude;
+    }
+
+    /**
+     * 交点計算に使うフォールバック高度を取得する。
+     */
+    private _getFallbackInteractionAltitude( altitude_hint?: number ): number
+    {
+        if ( altitude_hint !== undefined ) {
+            return altitude_hint;
+        }
+
+        if ( this._last_valid_interaction_altitude !== undefined ) {
+            return this._last_valid_interaction_altitude;
+        }
+
+        return this._getFallbackGroundElevation();
+    }
+
+    /**
+     * 回転中心を取得する。
+     */
+    private _pickRotationCenter( screen_position: mapray.Vector2 | [x: number, y: number] ): mapray.Vector3 | undefined
+    {
+        const picked_position = this._pickInteractionPosition( screen_position, undefined, true );
+        if ( picked_position ) {
+            return picked_position;
+        }
+
+        const canvas = this.viewer.canvas_element;
+        const center_position = GeoMath.createVector2( [canvas.width / 2, canvas.height / 2] );
+        return this._pickInteractionPosition( center_position, undefined, true );
     }
 
     /**
@@ -1569,6 +1658,44 @@ class StandardUIViewer extends mapray.RenderCallback
         const variable_t = t1 > 0 ? t1 : ( t2 > 0 ? t2 : undefined );
 
         if ( variable_t === undefined ) {
+            return undefined;
+        }
+
+        return GeoMath.add3(
+            GeoMath.scale3( variable_t, ray.direction, GeoMath.createVector3() ),
+            ray.position,
+            GeoMath.createVector3()
+        );
+    }
+
+    /**
+     * キャンバス座標に対応するレイと、現在地付近の接平面との交点を取得する。
+     */
+    private _intersectCanvasRayWithGroundPlane( screen_position: mapray.Vector2 | [x: number, y: number], altitude: number ): mapray.Vector3 | undefined
+    {
+        const ray = this.viewer.camera.getCanvasRay( screen_position );
+        const plane_geo_point = new mapray.GeoPoint(
+            this._camera_parameter.longitude,
+            this._camera_parameter.latitude,
+            altitude
+        );
+        const plane_origin = plane_geo_point.getAsGocs( GeoMath.createVector3() );
+        const plane_matrix = plane_geo_point.getMlocsToGocsMatrix( GeoMath.createMatrix() );
+        const plane_normal = GeoMath.createVector3( [
+            plane_matrix[8],
+            plane_matrix[9],
+            plane_matrix[10],
+        ] );
+        const denominator = GeoMath.dot3( plane_normal, ray.direction );
+
+        if ( Math.abs( denominator ) < 1e-6 ) {
+            return undefined;
+        }
+
+        const plane_offset = GeoMath.sub3( plane_origin, ray.position, GeoMath.createVector3() );
+        const variable_t = GeoMath.dot3( plane_normal, plane_offset ) / denominator;
+
+        if ( variable_t <= 0 ) {
             return undefined;
         }
 
