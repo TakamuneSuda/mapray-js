@@ -129,6 +129,14 @@ export interface Info {
      * @default 8
      */
     resolution_power?: number;
+
+
+    /**
+     * DEM タイルの同時リクエスト数の上限
+     *
+     * @default 10
+     */
+    request_limit?: number;
 }
 
 
@@ -141,11 +149,13 @@ export function applyInfoWithDefaults( info: Info ): Required<Info>
 {
     return {
         resolution_power: info.resolution_power ?? DEFAULT_RESOLUTION_POWER,
+        request_limit:    info.request_limit    ?? DEFAULT_REQUEST_LIMIT,
     };
 }
 
 
 const DEFAULT_RESOLUTION_POWER = 8;
+const DEFAULT_REQUEST_LIMIT = 10;
 
 
 
