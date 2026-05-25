@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+
+<html>
+<head>
+<meta charset="UTF-8"/>
+<link rel="stylesheet" type="text/css" href="app.css"/>
+<script type="text/javascript" src="dist/bundle.js"></script>
+<script type="text/javascript">
+window.addEventListener("load", () => {
+  const tools = document.getElementById("tools");
+  const select = document.getElementById("dem-provider");
+  const status = document.getElementById("dem-status");
+  let viewer;
+
+  const getProviderName = () => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("dem_provider") || select.value;
+  };
+
+  const start = (provider) => {
+    if (viewer) {
+      viewer.destroy();
+    }
+    if (status) {
+      status.textContent = `Switching to ${provider}...`;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set("dem_provider", provider);
+    window.history.replaceState(null, "", url.toString());
+    viewer = new App("ui", {
+      tools: tools,
+      dem_provider: provider
+    });
+  };
+
+  select.value = getProviderName();
+  select.addEventListener("change", () => start(select.value));
+  start(select.value);
+});
+</script>
+</head>
+
+<body>
+<div id="ui"></div>
+<div id="tools">
+  <label>
+    DEM
+    <select id="dem-provider">
+      <option value="cloud">mapray cloud</option>
+      <option value="terrain-rgb">terrain-rgb</option>
+      <option value="signed-rgb">signed-rgb</option>
+      <option value="flat">flat</option>
+    </select>
+  </label>
+  <div id="dem-status" aria-live="polite"></div>
+  <div>m: render mode</div>
+</div>
+</body>
+</html>

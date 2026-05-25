@@ -689,6 +689,7 @@ class Belt {
 
         await this.dem_provider.init();
         this.rho = this.dem_provider.getInfo().resolution_power;
+        this._max_dem_requesteds = this.dem_provider.getInfo().request_limit;
         this.dem_zbias = GeoMath.LOG2PI - this.rho + 1;  // b = log2(π) - ρ + 1
 
         await this._requestRoot();
@@ -724,7 +725,8 @@ class Belt {
             this._root_cancel_id = undefined;
         }
 
-        cfa_assert( this._num_dem_requesteds == 0 );
+        // リクエストの中には AbortSignal の通知後に非同期で終了するものがある。
+        // 破棄時点ではキャンセル要求だけ行い、完了処理側でカウントを閉じる。
     }
 
     /**
@@ -1983,7 +1985,6 @@ export class Flake implements Area {
                         const data = await request;
                         if ( !flake._parent ) {
                             // すでに破棄済みなので無視
-                            belt.decrement_dem_requesteds();
                             return;
                         }
                         flake._dem_data  = new DemBinary( flake.z, flake.x, flake.y, belt.rho, data );
@@ -1991,10 +1992,16 @@ export class Flake implements Area {
                         belt.dem_area_updated.addTileArea( flake );
                     }
                     catch(err) {
+                        if ( !flake._parent ) {
+                            // すでに破棄済みなので無視
+                            return;
+                        }
                         flake._dem_data  = null;
                         flake._dem_state = DemState.FAILED;
                     }
-                    belt.decrement_dem_requesteds();
+                    finally {
+                        belt.decrement_dem_requesteds();
+                    }
                 } )();
 
                 break;
